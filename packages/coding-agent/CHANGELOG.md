@@ -137,7 +137,7 @@
 - Refreshed MCP providers immediately after server changes so OAuth connections can be started without restarting Prime Agent.
 
 - Changed ACP IPython tool calls to be titled by their cell and to carry the cell source as content, so a client no longer shows a column of identical "IPython cell" rows with nothing in them ([#1309](https://github.com/PrimeIntellect-ai/prime-agent/pull/1309) by [@AndriyPytel](https://github.com/AndriyPytel)).
-- Added an ACP `available_commands_update` after `session/new`, so ACP clients can complete the session commands, skills, prompt templates, and extension commands a prompt turn actually executes.
+- Added an ACP `available_commands_update` after `session/new`, so ACP clients can complete the session commands, skills, prompt templates, and extension commands a prompt turn actually executes ([#1308](https://github.com/PrimeIntellect-ai/prime-agent/pull/1308) by [@AndriyPytel](https://github.com/AndriyPytel)).
 
 ## [0.7.4] - 2026-08-19
 
