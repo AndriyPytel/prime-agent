@@ -1,0 +1,27 @@
+{
+  "version": "v0.7.4-apytel.1",
+  "package": "prime-agent",
+  "tarball": "releases/v0.7.4-apytel.1/prime-agent-0.7.4-apytel.1.tgz",
+  "tarballs": [
+    {
+      "package": "prime-agent",
+      "file": "prime-agent-0.7.4-apytel.1.tgz",
+      "sha256": "bc6d501255704cb49b491d01a4c1f0af47b52e543bb77c3e2546e6fd06697f07"
+    },
+    {
+      "package": "prime-agent-ai",
+      "file": "prime-agent-ai-0.7.4-apytel.1.tgz",
+      "sha256": "d514e0c423456073ebce18c2990ef841729388f3c30b98d6aa5f35373911619c"
+    },
+    {
+      "package": "prime-agent-core",
+      "file": "prime-agent-core-0.7.4-apytel.1.tgz",
+      "sha256": "a6b7c46b61baa957a406565c96580743c948681ffa8def656b1954867b247313"
+    },
+    {
+      "package": "prime-agent-tui",
+      "file": "prime-agent-tui-0.7.4-apytel.1.tgz",
+      "sha256": "7810e7eb1318a9c1b6e53fa3b62101e3c5d6706a0367cfe49306b6d755040832"
+    }
+  ]
+}
