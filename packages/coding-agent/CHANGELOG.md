@@ -136,6 +136,8 @@
 - Fixed the Agents View heartbeat refresh failing entirely ("Cannot list heartbeats while session worker is failed") when any resident worker was terminally failed: failed workers are now excluded from the global catalog while recovering and disconnected workers still fail closed.
 - Refreshed MCP providers immediately after server changes so OAuth connections can be started without restarting Prime Agent.
 
+- Changed ACP IPython tool calls to be titled by their cell and to carry the cell source as content, so a client no longer shows a column of identical "IPython cell" rows with nothing in them.
+
 ## [0.7.4] - 2026-08-19
 
 - Fixed model searches ranking stronger matches ahead of weaker signed-in matches while preferring signed-in providers for equivalent results ([#539](https://github.com/PrimeIntellect-ai/prime-agent/pull/539) by [@eliebak](https://github.com/eliebak)).
