@@ -64,6 +64,8 @@ Session activity arrives as `session/update` notifications:
 | tool finishes | `tool_call_update` (`completed` / `failed`) |
 | shell output | `tool_call` plus incremental `tool_call_update` |
 
+After `session/new`, one `available_commands_update` lists the commands a prompt turn executes: the session commands (`compact`, `refine`, `goal`, `autonomous`), skills as `skill:<name>`, prompt templates, and extension commands. Commands that open a TUI selector, such as `/model` and `/settings`, are not advertised — outside the TUI they are ordinary prompt text.
+
 The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source. The call is titled by the cell's first meaningful line, and the source also travels as a fenced content block for clients that render content rather than `rawInput`. Both treat the cell as untrusted text: the fence outruns the longest backtick run in the source, and control characters and bidi overrides are stripped from the title.
 
 ## Prime Agent extensions
