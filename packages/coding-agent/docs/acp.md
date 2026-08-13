@@ -66,7 +66,10 @@ Session activity arrives as `session/update` notifications:
 
 After `session/new`, one `available_commands_update` lists the commands a prompt turn executes: the session commands (`compact`, `refine`, `goal`, `autonomous`), skills as `skill:<name>`, prompt templates, and extension commands. Commands that open a TUI selector, such as `/model` and `/settings`, are not advertised — outside the TUI they are ordinary prompt text.
 
+Each name appears once, resolved the way a submitted command is: a session builtin first, then an extension command, then a skill, then a prompt template. The list is an initial snapshot; ACP has no method to reload resources, and a reload from elsewhere raises no session event, so nothing can invalidate it for the life of the connection.
+
 The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source. The call is titled by the cell's first meaningful line, and the source also travels as a fenced content block for clients that render content rather than `rawInput`. Both treat the cell as untrusted text: the fence outruns the longest backtick run in the source, and control characters and bidi overrides are stripped from the title.
+>>>>>>> c136b7f8a (fix(acp): advertise one command per name, in submission order)
 
 ## Prime Agent extensions
 
