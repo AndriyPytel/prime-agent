@@ -16,6 +16,7 @@ import type {
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionInputPause,
+	AgentConnectionSlashCommand,
 } from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
 import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "./acp-events.js";
@@ -131,6 +132,7 @@ interface AcpSessionEntry {
 	promptTask: Promise<void> | undefined;
 	resolvePromptTask: (() => void) | undefined;
 	unsubscribe: (() => void) | undefined;
+	commandsTimer: ReturnType<typeof setTimeout> | undefined;
 	producer: AcpUpdateProducer;
 }
 
@@ -456,11 +458,27 @@ async function turnFailure(connection: AgentConnection, boundary: TurnBoundary):
 }
 
 /**
+ * The order a submitted command is resolved in, mirroring `_normalizeSubmission`:
+ * a session builtin first, then an extension command, then a skill, then a
+ * prompt template. Extension names are already disambiguated upstream, so only
+ * collisions across these sources have to be resolved here.
+ */
+const CONNECTION_COMMAND_PRECEDENCE: Record<AgentConnectionSlashCommand["source"], number> = {
+	extension: 0,
+	skill: 1,
+	prompt: 2,
+};
+
+/**
  * Commands an ACP client can offer for completion.
  *
  * Only commands a prompt actually executes are advertised. The rest of
  * `BUILTIN_SLASH_COMMANDS` opens a TUI selector (`/model`, `/settings`) and has
  * no headless behavior, so listing it would complete to plain prompt text.
+ *
+ * One entry per name, resolved the way a submission is: a client cannot know
+ * which route wins, so advertising both sides of a collision is worse than
+ * advertising the loser not at all.
  */
 async function acpAvailableCommands(connection: AgentConnection): Promise<acp.AvailableCommand[]> {
 	const sessionCommands = BUILTIN_SLASH_COMMANDS.filter((command) => command.execution === "session").map(
@@ -473,14 +491,25 @@ async function acpAvailableCommands(connection: AgentConnection): Promise<acp.Av
 	// Skills, prompt templates, and extension commands. A failure here costs
 	// completion, not the session, so it must not reject session/new.
 	const connectionCommands = await connection.getCommands().catch(() => []);
-	return [
+	const advertised = [
 		...sessionCommands,
-		...connectionCommands.map((command) => ({
-			name: command.name,
-			description: command.description ?? "",
-			...(command.argumentHint ? { input: { hint: command.argumentHint } } : {}),
-		})),
+		...[...connectionCommands]
+			.sort(
+				(left, right) => CONNECTION_COMMAND_PRECEDENCE[left.source] - CONNECTION_COMMAND_PRECEDENCE[right.source],
+			)
+			.map((command) => ({
+				name: command.name,
+				description: command.description ?? "",
+				...(command.argumentHint ? { input: { hint: command.argumentHint } } : {}),
+			})),
 	];
+	// A name that resolves to one route must be advertised once, or a client
+	// completes to an entry whose description belongs to a route that will not run.
+	const byName = new Map<string, acp.AvailableCommand>();
+	for (const command of advertised) {
+		if (!byName.has(command.name)) byName.set(command.name, command);
+	}
+	return [...byName.values()];
 }
 
 export async function runAcpMode(runtimeHost: AgentSessionRuntime): Promise<never> {
@@ -786,6 +815,7 @@ export async function runAcpModeWithConnection(
 				const entry: AcpSessionEntry = {
 					id: sessionId,
 					abort: undefined,
+					commandsTimer: undefined,
 					cancelling: false,
 					cancelTask: undefined,
 					stopFailure: undefined,
@@ -862,7 +892,7 @@ export async function runAcpModeWithConnection(
 				};
 				// Sent after this handler returns: a client cannot route a session
 				// update for a session id it has not been told about yet.
-				setTimeout(() => {
+				entry.commandsTimer = setTimeout(() => {
 					void acpAvailableCommands(connection).then((availableCommands) =>
 						ctx.client
 							.notify(acp.methods.client.session.update, {
@@ -1044,6 +1074,7 @@ export async function runAcpModeWithConnection(
 			});
 			const closing = session;
 			try {
+				if (closing.commandsTimer) clearTimeout(closing.commandsTimer);
 				await closing.cancelTask?.catch(() => undefined);
 				closing.cancelling = true;
 				closing.abort?.abort();
@@ -1135,6 +1166,7 @@ export async function runAcpModeWithConnection(
 	// harness that spawns many short-lived sessions.
 	await handle.closed.catch(() => undefined);
 	session?.abort?.abort();
+	if (session?.commandsTimer) clearTimeout(session.commandsTimer);
 	session?.unsubscribe?.();
 	await session?.inputPause?.release().catch(() => undefined);
 	session = undefined;
