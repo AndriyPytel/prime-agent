@@ -512,6 +512,34 @@ async function acpAvailableCommands(connection: AgentConnection): Promise<acp.Av
 	return [...byName.values()];
 }
 
+/**
+ * Context-window usage for the session, as ACP's `usage_update`.
+ *
+ * Usage is unknown until a model response has been costed — notably right after
+ * compaction — and a client cannot render a fraction without both numbers, so an
+ * unknown reading is skipped rather than reported as zero.
+ */
+async function acpUsageUpdate(connection: AgentConnection): Promise<Record<string, unknown> | undefined> {
+	const usage = await connection
+		.getState()
+		.then((state) => state.contextUsage)
+		.catch(() => undefined);
+	if (!usage || usage.tokens === null || usage.contextWindow <= 0) return undefined;
+	return { sessionUpdate: "usage_update", used: usage.tokens, size: usage.contextWindow };
+}
+
+/**
+ * Events after which the context can hold a different number of tokens.
+ *
+ * Only a completed assistant message carries the usage the reading is computed
+ * from, and compaction replaces the transcript, so polling on anything else
+ * would cost a round trip per streamed delta to report an unchanged number.
+ */
+function changesContextUsage(event: AgentConnectionSessionEvent): boolean {
+	if (event.type === "compaction_end") return true;
+	return event.type === "message_end" && event.message.role === "assistant";
+}
+
 export async function runAcpMode(runtimeHost: AgentSessionRuntime): Promise<never> {
 	const connection = new InProcessAgentConnection(runtimeHost);
 	return runAcpModeWithConnection(connection, {
@@ -851,6 +879,11 @@ export async function runAcpModeWithConnection(
 						observedChildren.set(event.event.child.id, event.event.child);
 					}
 					const turnId = producer.turnForEvent(event.event);
+					if (changesContextUsage(event.event)) {
+						void acpUsageUpdate(connection).then((update) => {
+							if (update) void producer.publish(update, turnId, "event");
+						});
+					}
 					for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
 						void producer.publish(update, turnId, "event");
 					}
