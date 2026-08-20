@@ -1448,6 +1448,36 @@ describe("ACP mode end to end", () => {
 		harness.cleanup();
 	}, 30_000);
 
+	it("offers the session's models as a model config option", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-smart", name: "Faux Smart" },
+				{ id: "faux-fast", name: "Faux Fast" },
+			],
+		});
+		const provider = harness.models[0].provider;
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+
+		const { client } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
+
+		const option = session.configOptions?.find((entry: acp.SessionConfigOption) => entry.id === "model");
+		expect(option).toMatchObject({
+			category: "model",
+			type: "select",
+			currentValue: `${provider}/faux-smart`,
+		});
+		// Every model the session can actually run, ordered by provider then id.
+		expect(option.options.map((value: { value: string }) => value.value)).toEqual([
+			`${provider}/faux-fast`,
+			`${provider}/faux-smart`,
+		]);
+		expect(option.options[0]).toMatchObject({ name: "faux-fast", description: provider });
+
+		harness.cleanup();
+	}, 30_000);
+
 	it("does not advertise commands to a session that was closed first", async () => {
 		const harness = await createHarness();
 		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
@@ -1487,6 +1517,45 @@ describe("ACP mode end to end", () => {
 		const usage = updates.filter((u) => u.update?.sessionUpdate === "usage_update").at(-1)?.update;
 		expect(usage.used).toBeGreaterThan(0);
 		expect(usage.size).toBeGreaterThan(usage.used);
+
+		harness.cleanup();
+	}, 30_000);
+
+	it("switches the model through session/set_config_option", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-smart", name: "Faux Smart" },
+				{ id: "faux-fast", name: "Faux Fast" },
+			],
+		});
+		const provider = harness.models[0].provider;
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+
+		const { client } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
+
+		const response = await client.request("session/set_config_option", {
+			sessionId: session.sessionId,
+			configId: "model",
+			value: `${provider}/faux-fast`,
+		});
+		// The complete configuration state comes back, not just the changed value.
+		expect(response.configOptions.find((entry: acp.SessionConfigOption) => entry.id === "model")).toMatchObject({
+			currentValue: `${provider}/faux-fast`,
+		});
+		expect((await connection.getState()).model?.id).toBe("faux-fast");
+
+		// A value that was never advertised must not leave the client believing the
+		// model changed.
+		await expect(
+			client.request("session/set_config_option", {
+				sessionId: session.sessionId,
+				configId: "model",
+				value: `${provider}/faux-imaginary`,
+			}),
+		).rejects.toThrow();
+		expect((await connection.getState()).model?.id).toBe("faux-fast");
 
 		harness.cleanup();
 	}, 30_000);

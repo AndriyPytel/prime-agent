@@ -21,6 +21,7 @@ Use ACP mode when something external needs to *drive* a session interactively: p
 | `initialize` | Returns protocol version, capabilities, and agent info. |
 | `session/new` | Creates the session. One session per connection. |
 | `session/prompt` | Runs one turn and resolves with a stop reason. |
+| `session/set_config_option` | Switches the session's model. |
 | `session/cancel` | Notification; aborts the addressed session's turn. |
 | `session/close` | Releases the session and frees the connection for a new one. |
 
@@ -28,6 +29,7 @@ One session per connection is a deliberate limit: Prime Agent's underlying sessi
 
 Likewise `session/prompt` refuses a concurrent turn while one is running, and the working directory cannot be changed after startup — a client-supplied `cwd` that differs from the agent's real one is reported back in `_meta` rather than silently ignored.
 
+<<<<<<< HEAD
 ## MCP servers
 
 Prime Agent accepts standard stdio and HTTP servers in `session/new.mcpServers`. The servers are
@@ -51,6 +53,26 @@ ACP connection that installed it, so another attached client cannot replace or c
 ACP stdio is a trusted-code boundary, not a sandbox. The requested command runs as the Prime Agent
 user and can access any files that user can access, including credential stores. Only accept stdio
 servers from trusted ACP clients or run Prime Agent inside an appropriate sandbox.
+=======
+## Model selection
+
+`session/new` returns a `model` [session config option](https://agentclientprotocol.com/protocol/session-config-options) — an ACP `select` in the `model` category — so a client can render a model picker:
+
+```json
+{
+  "id": "model",
+  "name": "Model",
+  "category": "model",
+  "type": "select",
+  "currentValue": "anthropic/claude-sonnet-4-5",
+  "options": [{ "value": "anthropic/claude-sonnet-4-5", "name": "claude-sonnet-4-5", "description": "anthropic" }]
+}
+```
+
+Values are the canonical `provider/id` reference, since the same model id is served by more than one provider. `session/set_config_option` switches the model and answers with the complete configuration state.
+
+Only models with configured credentials are offered. The TUI lists the rest and starts a sign-in when one is picked; ACP has no sign-in flow, so an unauthenticated model would be a choice that only fails at the next prompt.
+>>>>>>> 87ce76424 (feat(acp): add model picker to ACP mode)
 
 ## Streamed updates
 
