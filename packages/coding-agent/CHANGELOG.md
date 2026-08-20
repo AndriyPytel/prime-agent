@@ -165,6 +165,8 @@
 - Fixed the Agents View heartbeat refresh failing entirely ("Cannot list heartbeats while session worker is failed") when any resident worker was terminally failed: failed workers are now excluded from the global catalog while recovering and disconnected workers still fail closed.
 - Refreshed MCP providers immediately after server changes so OAuth connections can be started without restarting Prime Agent.
 
+- Added ACP `usage_update` reporting, so an ACP client can show how much of the context window a session has consumed ([#1351](https://github.com/PrimeIntellect-ai/prime-agent/pull/1351) by [@AndriyPytel](https://github.com/AndriyPytel)).
+- Added a model picker to ACP mode: `session/new` advertises the session's models as a `model` config option and `session/set_config_option` switches between them.
 - Changed ACP IPython tool calls to be titled by their cell and to carry the cell source as content, so a client no longer shows a column of identical "IPython cell" rows with nothing in them ([#1309](https://github.com/PrimeIntellect-ai/prime-agent/pull/1309) by [@AndriyPytel](https://github.com/AndriyPytel)).
 - Added an ACP `available_commands_update` after `session/new`, so ACP clients can complete the session commands, skills, prompt templates, and extension commands a prompt turn actually executes ([#1308](https://github.com/PrimeIntellect-ai/prime-agent/pull/1308) by [@AndriyPytel](https://github.com/AndriyPytel)).
 
@@ -200,7 +202,6 @@
 - Fixed `openai-codex` models being invisible to `rlm` subagents and `find_models` because model discovery reported Prime Agent's own version as the Codex client version ([#1375](https://github.com/PrimeIntellect-ai/prime-agent/pull/1375) by [@bilelrais](https://github.com/bilelrais)).
 - Added a working hint that recommends sharing traces with Prime Intellect to help train open-source LLMs.
 - Restored bare `prime-agent --resume` opening the agents view and the `/resume [id|path]` slash command; bare commands open the agents view and an argument resumes that session in place.
-- Added ACP `usage_update` reporting, so an ACP client can show how much of the context window a session has consumed ([#1351](https://github.com/PrimeIntellect-ai/prime-agent/pull/1351) by [@AndriyPytel](https://github.com/AndriyPytel)).
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Fixed ctrl+p ("Toggle agent message expansion") only toggling received agent messages; it now expands and collapses sent agent messages together with received ones.
 
