@@ -13,6 +13,7 @@ import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
 import { InProcessAgentConnection } from "../agent-connection/in-process-agent-connection.js";
 import type {
 	AgentConnection,
+	AgentConnectionModel,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionInputPause,
@@ -351,6 +352,58 @@ function promptContent(blocks: readonly unknown[]): { text: string; images: Imag
 		}
 	}
 	return { text: texts.join("\n"), images };
+}
+
+/** ACP config option id for the model selector. */
+const MODEL_CONFIG_ID = "model";
+
+/**
+ * The canonical `provider/id` reference for a model.
+ *
+ * The same model id is served by more than one provider, so an id alone does
+ * not identify a model. This is the key `findExactModelReferenceMatch` and the
+ * TUI picker already use, so a value a client sends back resolves to the model
+ * that was advertised.
+ */
+function modelValueId(model: AgentConnectionModel): string {
+	return `${model.provider}/${model.id}`;
+}
+
+/**
+ * The session's model as an ACP config option, so a client can render a model
+ * picker instead of being stuck with whatever model the agent started on.
+ *
+ * Only models with configured credentials are offered. The TUI lists the rest
+ * and starts a sign-in when one is picked; ACP has no sign-in flow, so an
+ * unauthenticated model would be a choice that only fails at the next prompt.
+ *
+ * Ordered the way the TUI picker orders equally-ranked models: by provider,
+ * flagship models first, then by id.
+ */
+async function acpConfigOptions(connection: AgentConnection): Promise<acp.SessionConfigOption[]> {
+	const [state, models] = await Promise.all([connection.getState(), connection.getAvailableModels()]);
+	if (!state.model) return [];
+	const currentValue = modelValueId(state.model);
+	// A select whose current value is not selectable is worse than no selector:
+	// the session's model lost its credentials and cannot be offered back.
+	if (!models.some((model) => modelValueId(model) === currentValue)) return [];
+	return [
+		{
+			id: MODEL_CONFIG_ID,
+			name: "Model",
+			category: "model",
+			type: "select",
+			currentValue,
+			options: [...models]
+				.sort(
+					(left, right) =>
+						left.provider.localeCompare(right.provider) ||
+						Number(right.featured === true) - Number(left.featured === true) ||
+						left.id.localeCompare(right.id, undefined, { numeric: true }),
+				)
+				.map((model) => ({ value: modelValueId(model), name: model.id, description: model.provider })),
+		},
+	];
 }
 
 function autonomousMeta(status: AgentAutonomousStatus | undefined): PrimeAgentAutonomousMeta | undefined {
@@ -824,6 +877,8 @@ export async function runAcpModeWithConnection(
 				) {
 					cwdMismatch = { requested: requestedCwd, actual: actualCwd };
 				}
+				// A failed read costs the client its model picker, not the session.
+				const configOptions = await acpConfigOptions(connection).catch(() => []);
 				const sessionId = randomUUID();
 				// Install the listener before fetching the snapshot. Child updates can arrive
 				// while the snapshot request is in flight; the connection remains the
@@ -913,6 +968,7 @@ export async function runAcpModeWithConnection(
 				session = entry;
 				const response = {
 					sessionId,
+					...(configOptions.length > 0 ? { configOptions } : {}),
 					...(cwdMismatch ? { _meta: primeAgentMeta({ cwd: cwdMismatch }) } : {}),
 				};
 				// The stream wrapper commits this gate after this exact response has
@@ -1090,6 +1146,24 @@ export async function runAcpModeWithConnection(
 				}
 				if (entry.abort === abort && entry.pendingTerminal?.abort !== abort) entry.abort = undefined;
 			}
+		})
+		.onRequest("session/set_config_option", async (ctx: any) => {
+			const params = ctx.params as { sessionId: string; configId: string; value?: unknown };
+			if (session?.id !== params.sessionId) {
+				throw new Error(`Unknown ACP session: ${params.sessionId}`);
+			}
+			if (params.configId !== MODEL_CONFIG_ID) {
+				throw new Error(`Unknown ACP config option: ${params.configId}`);
+			}
+			// Resolve against the advertised values rather than parsing the id: a
+			// model id can itself contain a slash, so splitting one off the provider
+			// would pick the wrong model.
+			const models = await connection.getAvailableModels();
+			const model = models.find((candidate) => modelValueId(candidate) === params.value);
+			if (!model) throw new Error(`Unknown model: ${String(params.value)}`);
+			await connection.setModel(model.provider, model.id);
+			// The response carries the complete configuration state, not the delta.
+			return { configOptions: await acpConfigOptions(connection) };
 		})
 		.onRequest("session/close", async (ctx: any) => {
 			const params = ctx.params as { sessionId: string };
