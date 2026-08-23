@@ -53,10 +53,15 @@ function textContent(text: string): { type: "text"; text: string } {
  * The delta discriminator lives on the event itself (`text_delta` /
  * `thinking_delta`) and carries a plain string, so reasoning and visible answer
  * text are distinct ACP update kinds a client can render or hide separately.
+ *
+ * Reasoning streams under its own id because ACP renders thought and answer as
+ * different messages.
  */
 function assistantDeltaUpdates(event: AssistantMessageEvent, messageId: string): AcpSessionUpdate[] {
 	if (event.type === "thinking_delta" && event.delta.length > 0) {
-		return [{ sessionUpdate: "agent_thought_chunk", messageId, content: textContent(event.delta) }];
+		return [
+			{ sessionUpdate: "agent_thought_chunk", messageId: `${messageId}-thought`, content: textContent(event.delta) },
+		];
 	}
 	if (event.type === "text_delta" && event.delta.length > 0) {
 		return [{ sessionUpdate: "agent_message_chunk", messageId, content: textContent(event.delta) }];
@@ -170,6 +175,8 @@ export interface AcpEventMappingState {
 	nextAssistantMessageSequence?: number;
 	/** Cell source per in-flight IPython call, keyed by tool call id. */
 	ipythonCells?: Map<string, string>;
+	/** Last telemetry published per subagent, keyed by child id. */
+	lastChildInfo?: Map<string, string>;
 }
 
 function startAssistantMessage(state: AcpEventMappingState): string {
@@ -297,24 +304,30 @@ export function acpUpdatesForSessionEvent(
 				},
 			];
 
-		case "rlm_child_update":
+		// A running child republishes its whole record on every tick, most of them
+		// byte-identical: one measured session sent 13,693 of these updates
+		// carrying 670 distinct states. Each one lands between two text chunks and
+		// costs the client a re-render, so only a changed record is worth sending.
+		case "rlm_child_update": {
+			const child = {
+				id: event.child.id,
+				sessionName: event.child.sessionName,
+				status: event.child.status,
+				model: event.child.model,
+				tokenCount: event.child.tokenCount,
+				error: event.child.error,
+			};
+			const published = JSON.stringify(child);
+			state.lastChildInfo ??= new Map();
+			if (state.lastChildInfo.get(child.id) === published) return [];
+			state.lastChildInfo.set(child.id, published);
 			return [
 				{
 					sessionUpdate: "session_info_update",
-					_meta: primeAgentMeta({
-						subagents: [
-							{
-								id: event.child.id,
-								sessionName: event.child.sessionName,
-								status: event.child.status,
-								model: event.child.model,
-								tokenCount: event.child.tokenCount,
-								error: event.child.error,
-							},
-						],
-					}),
+					_meta: primeAgentMeta({ subagents: [child] }),
 				},
 			];
+		}
 
 		// Goals, continual-harness refinement, and agent-to-agent messaging are
 		// prime-agent concepts with no ACP counterpart. They are still part of a
