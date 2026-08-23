@@ -48,6 +48,26 @@ function textContent(text: string): { type: "text"; text: string } {
 }
 
 /**
+ * Whether an update must wait rather than land between two message chunks.
+ *
+ * The JetBrains client groups chunks by nothing but the update type next to
+ * them: `ChunkBuffer.shouldAppendToBuffer` compares `lastElement.getClass()`,
+ * and `Acp2ToAUIConverter` flushes the buffer on any other type, so an update
+ * arriving mid-message ends the Markdown block there and a table spanning the
+ * gap never parses. It reads no `messageId` at all — the field is absent from
+ * the constant pool of both classes, though the deserialized model exposes it —
+ * and the spec made it opt-in for exactly this reason (RFD #244, PR #536).
+ *
+ * These two carry no ordering against the text and are the ones that arrive in
+ * bulk. Measured on `~/Library/Logs/JetBrains/WebStorm2026.2/acp/acp.log`,
+ * holding them takes torn chunk pairs from 5 of 85 to 2 of 85; what remains is
+ * a tool call or a thought, which is a real boundary and not noise.
+ */
+export function acpDefersWhileStreaming(update: AcpSessionUpdate): boolean {
+	return update.sessionUpdate === "session_info_update" || update.sessionUpdate === "usage_update";
+}
+
+/**
  * Identify the assistant message a chunk belongs to.
  *
  * ACP groups chunks by `messageId`, and a change of id means a new message.
@@ -57,8 +77,13 @@ function textContent(text: string): { type: "text"; text: string } {
  * answer arrived as separate Markdown documents and no table spanning a gap ever
  * parsed. Reasoning streams under its own id because ACP renders thought and
  * answer as different messages.
+ *
+ * It is what the protocol asks for and it is not what fixes that client, which
+ * reads no id and is answered by `acpDefersWhileStreaming` instead. Sent here
+ * for the clients that do read it, and for v2, where the field is required.
  */
 function assistantMessageId(state: AcpEventMappingState, thought: boolean): string {
+	state.streaming = true;
 	if (state.messageId === undefined) {
 		state.messageSeq = (state.messageSeq ?? 0) + 1;
 		state.messageId = `prime-agent-${Date.now().toString(36)}-${state.messageSeq}`;
@@ -218,6 +243,8 @@ export interface AcpEventMappingState {
 	/** ACP message id the current assistant message streams under. */
 	messageId?: string;
 	messageSeq?: number;
+	/** Whether an assistant message is between its first chunk and its end. */
+	streaming?: boolean;
 	/** Last telemetry published per subagent, keyed by child id. */
 	lastChildInfo?: Map<string, string>;
 }
@@ -231,10 +258,26 @@ export function acpUpdatesForSessionEvent(
 			if (event.message.role !== "assistant") return [];
 			return assistantDeltaUpdates(event.assistantMessageEvent, state);
 
+		// The end of an assistant message closes the message the chunks stream
+		// under, and it is the only boundary that arrives. `start` is the
+		// natural one and never reaches here: the daemon rebuilds the stream
+		// and drops it (`compact-session-stream.ts :: reconstruct` returns
+		// undefined for it), so an id anchored on `start` never rotates. In a
+		// measured WebStorm session 86 chunks of four separate answers all
+		// streamed as `prime-agent-mt5x19ed-1`, one message for the whole
+		// session, which is what a v2 client would render.
+		case "message_end":
+			if (event.message.role !== "assistant") return [];
+			state.messageId = undefined;
+			state.streaming = false;
+			return [];
+
 		// A cancelled or interrupted call never reports an end, so the run ending
-		// is the point at which a still-held cell is known to be unreachable.
+		// is the point at which a still-held cell is known to be unreachable, and
+		// the point a message left open by the cancellation is known to be over.
 		case "agent_end":
 			state.ipythonCells?.clear();
+			state.streaming = false;
 			return [];
 
 		case "tool_execution_start": {
