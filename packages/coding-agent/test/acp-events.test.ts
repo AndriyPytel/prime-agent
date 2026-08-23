@@ -20,12 +20,71 @@ function assistantDelta(type: "text_delta" | "thinking_delta", delta: string): A
 describe("ACP session event mapping", () => {
 	it("maps assistant text deltas to agent_message_chunk", () => {
 		const updates = acpUpdatesForSessionEvent(assistantDelta("text_delta", "hello"));
-		expect(updates).toEqual([{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } }]);
+		expect(updates).toEqual([
+			{
+				sessionUpdate: "agent_message_chunk",
+				messageId: expect.any(String),
+				content: { type: "text", text: "hello" },
+			},
+		]);
 	});
 
 	it("maps thinking deltas to agent_thought_chunk, not visible text", () => {
 		const updates = acpUpdatesForSessionEvent(assistantDelta("thinking_delta", "reasoning"));
-		expect(updates).toEqual([{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "reasoning" } }]);
+		expect(updates).toEqual([
+			{
+				sessionUpdate: "agent_thought_chunk",
+				messageId: expect.any(String),
+				content: { type: "text", text: "reasoning" },
+			},
+		]);
+	});
+
+	it("keeps one messageId across an interleaved update so chunks stay one message", () => {
+		const state: AcpEventMappingState = {};
+		const first = acpUpdatesForSessionEvent(assistantDelta("text_delta", "| a | b |\n"), state);
+		acpUpdatesForSessionEvent(
+			{ type: "rlm_child_update", child: { id: "sub-1", status: "running" } } as never,
+			state,
+		);
+		const second = acpUpdatesForSessionEvent(assistantDelta("text_delta", "|---|---|\n"), state);
+		expect(second[0]?.messageId).toBe(first[0]?.messageId);
+	});
+
+	it("separates reasoning from the answer, and each assistant message from the next", () => {
+		const state: AcpEventMappingState = {};
+		const text = acpUpdatesForSessionEvent(assistantDelta("text_delta", "answer"), state);
+		const thought = acpUpdatesForSessionEvent(assistantDelta("thinking_delta", "reasoning"), state);
+		expect(thought[0]?.messageId).not.toBe(text[0]?.messageId);
+
+		acpUpdatesForSessionEvent(
+			{
+				type: "message_update",
+				message: { role: "assistant", content: [], usage: {} } as never,
+				assistantMessageEvent: { type: "start", partial: {} } as never,
+			} as AgentConnectionSessionEvent,
+			state,
+		);
+		const next = acpUpdatesForSessionEvent(assistantDelta("text_delta", "second"), state);
+		expect(next[0]?.messageId).not.toBe(text[0]?.messageId);
+	});
+
+	it("publishes a subagent record only when it changes", () => {
+		const state: AcpEventMappingState = {};
+		const tick = (tokenCount: number) =>
+			acpUpdatesForSessionEvent(
+				{ type: "rlm_child_update", child: { id: "sub-1", status: "running", tokenCount } } as never,
+				state,
+			);
+		expect(tick(10)).toHaveLength(1);
+		expect(tick(10)).toEqual([]);
+		expect(tick(20)).toHaveLength(1);
+		expect(
+			acpUpdatesForSessionEvent(
+				{ type: "rlm_child_update", child: { id: "sub-2", status: "running", tokenCount: 10 } } as never,
+				state,
+			),
+		).toHaveLength(1);
 	});
 
 	it("ignores empty deltas and non-assistant messages", () => {
