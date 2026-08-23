@@ -543,7 +543,7 @@ async function acpAvailableCommands(connection: AgentConnection): Promise<acp.Av
 	);
 	// Skills, prompt templates, and extension commands. A failure here costs
 	// completion, not the session, so it must not reject session/new.
-	const connectionCommands = await connection.getCommands().catch(() => []);
+	const connectionCommands = await Promise.resolve(connection.getCommands?.() ?? []).catch(() => []);
 	const advertised = [
 		...sessionCommands,
 		...[...connectionCommands]
