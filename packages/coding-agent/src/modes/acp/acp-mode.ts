@@ -20,7 +20,12 @@ import type {
 	AgentConnectionSlashCommand,
 } from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
-import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "./acp-events.js";
+import {
+	type AcpEventMappingState,
+	type AcpSessionUpdate,
+	acpDefersWhileStreaming,
+	acpUpdatesForSessionEvent,
+} from "./acp-events.js";
 import { resolveAcpMcpServers } from "./acp-mcp.js";
 import { PRIME_AGENT_META_NAMESPACE, type PrimeAgentAutonomousMeta, primeAgentMeta } from "./acp-meta.js";
 import { type AcpStopReason, acpStopReason } from "./acp-stop-reason.js";
@@ -572,7 +577,7 @@ async function acpAvailableCommands(connection: AgentConnection): Promise<acp.Av
  * compaction — and a client cannot render a fraction without both numbers, so an
  * unknown reading is skipped rather than reported as zero.
  */
-async function acpUsageUpdate(connection: AgentConnection): Promise<Record<string, unknown> | undefined> {
+async function acpUsageUpdate(connection: AgentConnection): Promise<AcpSessionUpdate | undefined> {
 	const usage = await connection
 		.getState()
 		.then((state) => state.contextUsage)
@@ -918,14 +923,33 @@ export async function runAcpModeWithConnection(
 				// the run that produced it.
 				const mappingState: AcpEventMappingState = {};
 				const observedChildren = new Map<string, unknown>();
+				// Telemetry held back for the length of a message, in arrival order.
+				// A client that groups chunks by what sits next to them tears the
+				// message on anything else, so the only thing that keeps an answer
+				// whole is that nothing else goes out while it streams
+				// (`acp-events.ts :: acpDefersWhileStreaming`). The text itself is
+				// never held: it streams token by token as it always has, and a
+				// reading of the context arrives a message late rather than in the
+				// middle of one.
+				const deferred: Array<{ update: AcpSessionUpdate; turnId: number }> = [];
+				const publishUpdate = (update: AcpSessionUpdate, turnId: number) => {
+					if (mappingState.streaming && acpDefersWhileStreaming(update)) {
+						deferred.push({ update, turnId });
+						return;
+					}
+					void producer.publish(update, turnId, "event");
+				};
+				const flushDeferred = () => {
+					if (mappingState.streaming) return;
+					for (const held of deferred.splice(0)) void producer.publish(held.update, held.turnId, "event");
+				};
 				const unsubscribe = connection.subscribe((event) => {
 					// Heartbeats are connection-scoped, including if one races a prompt.
 					// They therefore intentionally use origin turn 0.
 					if (event.type === "heartbeats_changed") {
-						void producer.publish(
+						publishUpdate(
 							{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({ heartbeatsChanged: true }) },
 							0,
-							"event",
 						);
 						return;
 					}
@@ -936,12 +960,19 @@ export async function runAcpModeWithConnection(
 					const turnId = producer.turnForEvent(event.event);
 					if (changesContextUsage(event.event)) {
 						void acpUsageUpdate(connection).then((update) => {
-							if (update) void producer.publish(update, turnId, "event");
+							if (update) {
+								publishUpdate(update, turnId);
+								flushDeferred();
+							}
 						});
 					}
 					for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
-						void producer.publish(update, turnId, "event");
+						publishUpdate(update, turnId);
 					}
+					// The mapper clears `streaming` on the end of a message and on a
+					// run ending, so what was held is released the moment there is no
+					// message left to tear.
+					flushDeferred();
 				});
 				try {
 					// Reconcile after subscribing so updates cannot be lost while the snapshot
