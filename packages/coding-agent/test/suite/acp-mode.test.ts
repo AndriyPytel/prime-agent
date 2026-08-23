@@ -844,8 +844,9 @@ describe("ACP mode end to end", () => {
 		expect(updates).toHaveLength(0);
 		releaseSnapshot();
 		const session = await pending;
-		await vi.waitFor(() => expect(updates).toHaveLength(1));
-		expect(updates[0]).toMatchObject({
+		const childUpdates = () => updates.filter((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents);
+		await vi.waitFor(() => expect(childUpdates()).toHaveLength(1));
+		expect(childUpdates()[0]).toMatchObject({
 			sessionId: session.sessionId,
 			update: {
 				_meta: {
@@ -960,12 +961,12 @@ describe("ACP mode end to end", () => {
 		connection.emitChild({ ...child, status: "done" });
 		await vi.waitFor(() =>
 			expect(
-				updates.some(
+				updates.filter(
 					(u) =>
 						u.update?.sessionUpdate === "session_info_update" &&
 						u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents,
 				),
-			).toBe(true),
+			).toHaveLength(2),
 		);
 		const childUpdates = updates
 			.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
