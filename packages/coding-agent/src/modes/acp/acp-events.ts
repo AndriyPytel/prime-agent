@@ -48,6 +48,26 @@ function textContent(text: string): { type: "text"; text: string } {
 }
 
 /**
+ * Whether an update must wait rather than land between two message chunks.
+ *
+ * The JetBrains client groups chunks by nothing but the update type next to
+ * them: `ChunkBuffer.shouldAppendToBuffer` compares `lastElement.getClass()`,
+ * and `Acp2ToAUIConverter` flushes the buffer on any other type, so an update
+ * arriving mid-message ends the Markdown block there and a table spanning the
+ * gap never parses. It reads no `messageId` at all — the field is absent from
+ * the constant pool of both classes, though the deserialized model exposes it —
+ * and the spec made it opt-in for exactly this reason (RFD #244, PR #536).
+ *
+ * These two carry no ordering against the text and are the ones that arrive in
+ * bulk. Measured on `~/Library/Logs/JetBrains/WebStorm2026.2/acp/acp.log`,
+ * holding them takes torn chunk pairs from 5 of 85 to 2 of 85; what remains is
+ * a tool call or a thought, which is a real boundary and not noise.
+ */
+export function acpDefersWhileStreaming(update: AcpSessionUpdate): boolean {
+	return update.sessionUpdate === "session_info_update" || update.sessionUpdate === "usage_update";
+}
+
+/**
  * Map one streaming assistant event to an ACP chunk.
  *
  * The delta discriminator lives on the event itself (`text_delta` /
@@ -175,6 +195,8 @@ export interface AcpEventMappingState {
 	nextAssistantMessageSequence?: number;
 	/** Cell source per in-flight IPython call, keyed by tool call id. */
 	ipythonCells?: Map<string, string>;
+	/** Whether an assistant message is between its first chunk and its end. */
+	streaming?: boolean;
 	/** Last telemetry published per subagent, keyed by child id. */
 	lastChildInfo?: Map<string, string>;
 }
@@ -195,21 +217,28 @@ export function acpUpdatesForSessionEvent(
 			if (event.message.role === "assistant") startAssistantMessage(state);
 			return [];
 
-		case "message_update":
+		case "message_update": {
 			if (event.message.role !== "assistant") return [];
-			return assistantDeltaUpdates(
+			const updates = assistantDeltaUpdates(
 				event.assistantMessageEvent,
 				state.activeAssistantMessageId ?? startAssistantMessage(state),
 			);
+			if (updates.length > 0) state.streaming = true;
+			return updates;
+		}
 
 		case "message_end":
-			if (event.message.role === "assistant") state.activeAssistantMessageId = undefined;
+			if (event.message.role !== "assistant") return [];
+			state.activeAssistantMessageId = undefined;
+			state.streaming = false;
 			return [];
 
 		// A cancelled or interrupted call never reports an end, so the run ending
-		// is the point at which a still-held cell is known to be unreachable.
+		// is the point at which a still-held cell is known to be unreachable, and
+		// the point a message left open by the cancellation is known to be over.
 		case "agent_end":
 			state.ipythonCells?.clear();
+			state.streaming = false;
 			return [];
 
 		case "tool_execution_start": {
