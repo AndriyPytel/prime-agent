@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "../src/modes/acp/acp-events.js";
-
+import {
+	type AcpEventMappingState,
+	acpDefersWhileStreaming,
+	acpToolKind,
+	acpUpdatesForSessionEvent,
+	bashToolCallId,
+} from "../src/modes/acp/acp-events.js";
+import { PRIME_AGENT_META_NAMESPACE } from "../src/modes/acp/acp-meta.js";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/types.js";
 
 /** Real streaming shape: the discriminator is on the event, delta is a string. */
@@ -57,6 +63,28 @@ describe("ACP session event mapping", () => {
 		expect(second[0]?.messageId).toBe(first[0]?.messageId);
 	});
 
+	it("holds telemetry while a message streams and releases it when the message ends", () => {
+		const state: AcpEventMappingState = {};
+		acpUpdatesForSessionEvent(assistantDelta("text_delta", "streaming"), state);
+
+		expect(state.streaming).toBe(true);
+		expect(acpDefersWhileStreaming({ sessionUpdate: "session_info_update" })).toBe(true);
+		expect(acpDefersWhileStreaming({ sessionUpdate: "usage_update" })).toBe(true);
+		expect(acpDefersWhileStreaming({ sessionUpdate: "tool_call" })).toBe(false);
+		expect(acpDefersWhileStreaming({ sessionUpdate: "agent_message_chunk" })).toBe(false);
+
+		acpUpdatesForSessionEvent({ type: "message_end", message: { role: "assistant" } } as never, state);
+		expect(state.streaming).toBe(false);
+	});
+
+	it("closes a message a cancelled run left open", () => {
+		const state: AcpEventMappingState = {};
+		acpUpdatesForSessionEvent(assistantDelta("text_delta", "cut off"), state);
+		acpUpdatesForSessionEvent({ type: "agent_end" } as never, state);
+
+		expect(state.streaming).toBe(false);
+	});
+
 	it("publishes a subagent record only when it changes", () => {
 		const state: AcpEventMappingState = {};
 		const tick = (tokenCount: number) =>
@@ -73,7 +101,6 @@ describe("ACP session event mapping", () => {
 				state,
 			),
 		).toHaveLength(1);
-	});
 	});
 
 	it("ignores empty deltas and non-assistant messages", () => {
