@@ -146,6 +146,52 @@ describe("ACP session event mapping", () => {
 		]);
 	});
 
+	it("republishes the cell with everything it has printed while it runs", () => {
+		const state: AcpEventMappingState = {};
+		acpUpdatesForSessionEvent(
+			{
+				type: "tool_execution_start",
+				toolCallId: "call-1",
+				toolName: "ipython",
+				args: { code: "for i in range(3):\n    print(i)" },
+			} as AgentConnectionSessionEvent,
+			state,
+		);
+		const chunk = (text: string) =>
+			acpUpdatesForSessionEvent(
+				{
+					type: "tool_execution_update",
+					toolCallId: "call-1",
+					toolName: "ipython",
+					args: {},
+					partialResult: { content: [{ type: "text", text }] },
+				} as AgentConnectionSessionEvent,
+				state,
+			);
+
+		chunk("0\n");
+		const second = chunk("1\n");
+		expect(second[0]).toMatchObject({ sessionUpdate: "tool_call_update", status: "in_progress" });
+		const blocks = (second[0]?.content as { content: { text: string } }[]).map((block) => block.content.text);
+		expect(blocks[0]).toContain("for i in range(3):");
+		expect(blocks[1]).toBe("```text\n0\n1\n\n```");
+
+		const end = acpUpdatesForSessionEvent(
+			{
+				type: "tool_execution_end",
+				toolCallId: "call-1",
+				toolName: "ipython",
+				result: { output: "0\n1\n2\n" },
+				isError: false,
+			} as AgentConnectionSessionEvent,
+			state,
+		);
+		const endBlocks = (end[0]?.content as { content: { text: string } }[]).map((block) => block.content.text);
+		expect(endBlocks[0]).toContain("for i in range(3):");
+		expect(endBlocks[1]).toContain("2");
+		expect(state.ipythonOutput?.size ?? 0).toBe(0);
+	});
+
 	it("titles a Python call by its cell so two calls are distinguishable", () => {
 		const title = (code: string) =>
 			acpUpdatesForSessionEvent({
@@ -206,7 +252,7 @@ describe("ACP session event mapping", () => {
 		);
 		expect(updates[0]?.content).toEqual([
 			{ type: "content", content: { type: "text", text: "```python\nprint(1)\n```" } },
-			{ type: "content", content: { type: "text", text: "1" } },
+			{ type: "content", content: { type: "text", text: "```text\n1\n```" } },
 		]);
 		// The entry is dropped once the call ends, so state cannot grow unbounded.
 		expect(state.ipythonCells?.size).toBe(0);
@@ -250,7 +296,7 @@ describe("ACP session event mapping", () => {
 			sessionUpdate: "tool_call_update",
 			toolCallId: "call-1",
 			status: "completed",
-			content: [{ type: "content", content: { type: "text", text: "done" } }],
+			content: [{ type: "content", content: { type: "text", text: "```text\ndone\n```" } }],
 		});
 		expect(updates[0]?._meta).toEqual({
 			[PRIME_AGENT_META_NAMESPACE]: {
