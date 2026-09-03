@@ -124,16 +124,37 @@ function ipythonCellTitle(code: string): string {
 }
 
 /**
- * The cell source as a content block, for clients that render no `rawInput`.
+ * A content block that renders verbatim, for clients that render no `rawInput`.
  *
- * A cell may legally contain a backtick fence of its own, so the fence has to
- * outrun the longest run in the source: a fixed three would let the rest of the
- * cell escape the code block and render as arbitrary Markdown.
+ * Cell source and its output may legally contain a backtick fence of their own,
+ * so the fence has to outrun the longest run in the text: a fixed three would
+ * let the rest of it escape the code block and render as arbitrary Markdown.
  */
-function ipythonCellContent(code: string): { type: "content"; content: { type: "text"; text: string } } {
-	const longestRun = Math.max(0, ...[...code.matchAll(/`+/g)].map((match) => match[0].length));
+function fencedContent(text: string, language: string): { type: "content"; content: { type: "text"; text: string } } {
+	const longestRun = Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
 	const fence = "`".repeat(Math.max(3, longestRun + 1));
-	return { type: "content", content: textContent([`${fence}python`, code, fence].join("\n")) };
+	return { type: "content", content: textContent([`${fence}${language}`, text, fence].join("\n")) };
+}
+
+function ipythonCellContent(code: string): { type: "content"; content: { type: "text"; text: string } } {
+	return fencedContent(code, "python");
+}
+
+/**
+ * The cell and whatever it has printed, as one content array.
+ *
+ * A client replaces a tool call's content on update rather than appending to
+ * it, so every update has to carry the whole picture: drop the cell here and
+ * the source vanishes the moment the first line of output arrives.
+ */
+function ipythonCallContent(
+	cell: string | undefined,
+	output: string | undefined,
+): { type: "content"; content: { type: "text"; text: string } }[] {
+	return [
+		...(cell !== undefined ? [ipythonCellContent(cell)] : []),
+		...(output ? [fencedContent(output, "text")] : []),
+	];
 }
 
 /** Extract the Python cell source so a client can show what is executing. */
@@ -200,6 +221,8 @@ export interface AcpEventMappingState {
 	nextAssistantMessageSequence?: number;
 	/** Cell source per in-flight IPython call, keyed by tool call id. */
 	ipythonCells?: Map<string, string>;
+	/** Output streamed so far per in-flight IPython call, keyed by tool call id. */
+	ipythonOutput?: Map<string, string>;
 	/** Whether an assistant message is between its first chunk and its end. */
 	streaming?: boolean;
 	/** Last telemetry published per subagent, keyed by child id. */
@@ -243,6 +266,7 @@ export function acpUpdatesForSessionEvent(
 		// the point a message left open by the cancellation is known to be over.
 		case "agent_end":
 			state.ipythonCells?.clear();
+			state.ipythonOutput?.clear();
 			state.streaming = false;
 			return [];
 
@@ -259,8 +283,29 @@ export function acpUpdatesForSessionEvent(
 					title: cell !== undefined ? ipythonCellTitle(cell) : event.toolName,
 					kind: acpToolKind(event.toolName),
 					status: "in_progress" satisfies AcpToolStatus,
-					...(cell !== undefined ? { content: [ipythonCellContent(cell)] } : {}),
+					...(cell !== undefined ? { content: ipythonCallContent(cell, undefined) } : {}),
 					rawInput: cell !== undefined ? { code: cell } : event.args,
+				},
+			];
+		}
+
+		// Output arrives in chunks while the cell runs, and a client that renders
+		// a tool call's content shows nothing of a long loop until it ends. The
+		// accumulated output is republished with the cell on every chunk, which
+		// is what makes a running cell readable rather than a spinner.
+		case "tool_execution_update": {
+			if (event.toolName !== IPYTHON_TOOL_NAME) return [];
+			const chunk = toolResultText(event.partialResult);
+			if (!chunk) return [];
+			state.ipythonOutput ??= new Map();
+			const output = (state.ipythonOutput.get(event.toolCallId) ?? "") + chunk;
+			state.ipythonOutput.set(event.toolCallId, output);
+			return [
+				{
+					sessionUpdate: "tool_call_update",
+					toolCallId: event.toolCallId,
+					status: "in_progress" satisfies AcpToolStatus,
+					content: ipythonCallContent(state.ipythonCells?.get(event.toolCallId), output),
 				},
 			];
 		}
@@ -273,10 +318,8 @@ export function acpUpdatesForSessionEvent(
 			// the moment the call completes.
 			const cell = state.ipythonCells?.get(event.toolCallId);
 			state.ipythonCells?.delete(event.toolCallId);
-			const content = [
-				...(cell !== undefined ? [ipythonCellContent(cell)] : []),
-				...(text ? [{ type: "content", content: textContent(text) }] : []),
-			];
+			state.ipythonOutput?.delete(event.toolCallId);
+			const content = ipythonCallContent(cell, text);
 			return [
 				{
 					sessionUpdate: "tool_call_update",

@@ -1,1 +1,2 @@
 - Changed the ACP tool-call kind for Python cells from `execute` to `other`, so a client that renders a terminal block for `execute` keeps showing the whole cell source after the call completes instead of a truncated one-line fallback.
+- Added streamed Python cell output to ACP tool calls: each chunk republishes the cell and the output so far, so a running cell is readable instead of showing only after it finishes.
