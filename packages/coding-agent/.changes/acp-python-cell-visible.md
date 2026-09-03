@@ -1,0 +1,1 @@
+- Changed the ACP tool-call kind for Python cells from `execute` to `other`, so a client that renders a terminal block for `execute` keeps showing the whole cell source after the call completes instead of a truncated one-line fallback.

@@ -93,7 +93,7 @@ After `session/new`, one `available_commands_update` lists the commands a prompt
 
 Each name appears once, resolved the way a submitted command is: a session builtin first, then an extension command, then a skill, then a prompt template. The list is an initial snapshot; ACP has no method to reload resources, and a reload from elsewhere raises no session event, so nothing can invalidate it for the life of the connection.
 
-The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source. The call is titled by the cell's first meaningful line, and the source also travels as a fenced content block for clients that render content rather than `rawInput`. Both treat the cell as untrusted text: the fence outruns the longest backtick run in the source, and control characters and bidi overrides are stripped from the title.
+The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `other` whose `rawInput` carries the cell source. The kind is deliberately not `execute`: a client that renders that kind as a terminal block drops the source once the call completes and falls back to a truncated `rawInput.command`, which a cell never carries. The call is titled by the cell's first meaningful line, and the source also travels as a fenced content block for clients that render content rather than `rawInput`. Both treat the cell as untrusted text: the fence outruns the longest backtick run in the source, and control characters and bidi overrides are stripped from the title.
 >>>>>>> c136b7f8a (fix(acp): advertise one command per name, in submission order)
 
 ## Prime Agent extensions

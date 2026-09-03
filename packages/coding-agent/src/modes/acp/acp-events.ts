@@ -24,7 +24,12 @@ export const IPYTHON_TOOL_NAME = "ipython";
 
 export function acpToolKind(toolName: string): AcpToolKind {
 	switch (toolName) {
+		// Not `execute`: the JetBrains client routes that kind to a terminal
+		// block whose details are nulled once the call completes, leaving a
+		// truncated fallback of `rawInput.command` — a key a cell has no reason
+		// to carry. The generic block renders the cell source unconditionally.
 		case IPYTHON_TOOL_NAME:
+			return "other";
 		case "bash":
 			return "execute";
 		case "read":
