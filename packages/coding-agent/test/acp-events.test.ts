@@ -125,8 +125,8 @@ describe("ACP session event mapping", () => {
 		).toEqual([]);
 	});
 
-	it("treats IPython as an execute tool call carrying its cell source", () => {
-		expect(acpToolKind("ipython")).toBe("execute");
+	it("carries the cell source on a tool call the client renders in full", () => {
+		expect(acpToolKind("ipython")).toBe("other");
 		const updates = acpUpdatesForSessionEvent({
 			type: "tool_execution_start",
 			toolCallId: "call-1",
@@ -138,7 +138,7 @@ describe("ACP session event mapping", () => {
 				sessionUpdate: "tool_call",
 				toolCallId: "call-1",
 				title: "print(1)",
-				kind: "execute",
+				kind: "other",
 				status: "in_progress",
 				content: [{ type: "content", content: { type: "text", text: "```python\nprint(1)\n```" } }],
 				rawInput: { code: "print(1)" },
