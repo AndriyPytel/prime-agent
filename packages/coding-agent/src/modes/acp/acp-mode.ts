@@ -516,6 +516,48 @@ async function turnFailure(connection: AgentConnection, boundary: TurnBoundary):
 }
 
 /**
+ * A fire-and-forget `rlm()` child keeps the session's unfinished-action count
+ * above zero for as long as it runs, and `waitForHeadlessCompletion` only
+ * resolves at zero. Bound the wait so a long-lived child cannot hold the
+ * `session/prompt` response open; the full reconciliation still runs to
+ * completion out of band in `finalizePendingTerminal`.
+ */
+const PROMPT_HEADLESS_COMPLETION_GRACE_MS = 3_000;
+
+/** Longest a `session_info_update`/`usage_update` may sit behind a streaming message. */
+const DEFERRED_TELEMETRY_FLUSH_MS = 500;
+
+/**
+ * Race a promise against a timeout, discarding the promise's result (not the
+ * promise itself) when the timeout wins.
+ *
+ * `AgentConnection.waitForHeadlessCompletion` takes no signal and cannot be
+ * cancelled, so a timeout here does not stop the underlying wait — it only
+ * stops waiting on it. The original promise keeps running: for
+ * `waitForHeadlessCompletion` specifically, that means one abandoned
+ * `session.waitForHeadlessIdle()` poll loop per call that hits the timeout,
+ * which self-resolves the moment the session actually reaches idle (the same
+ * idleness a long-lived child can delay indefinitely, which is why this
+ * exists) and is otherwise inert: its result is read by nobody, and the
+ * `.catch()` below keeps it from surfacing as an unhandled rejection. This is
+ * a real orphaned promise per superseded wait, not a no-op — accepted because
+ * the connection interface has no cancellable variant to call instead.
+ */
+async function withGracePeriod<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => resolve(undefined), ms);
+		timer.unref?.();
+	});
+	try {
+		return await Promise.race([promise, timeout]);
+	} finally {
+		clearTimeout(timer!);
+		promise.catch(() => undefined);
+	}
+}
+
+/**
  * The order a submitted command is resolved in, mirroring `_normalizeSubmission`:
  * a session builtin first, then an extension command, then a skill, then a
  * prompt template. Extension names are already disambiguated upstream, so only
@@ -932,18 +974,37 @@ export async function runAcpModeWithConnection(
 				// reading of the context arrives a message late rather than in the
 				// middle of one.
 				const deferred: Array<{ update: AcpSessionUpdate; turnId: number }> = [];
+				// A long assistant message can hold telemetry for its whole duration,
+				// which is fine for a chunky answer but starves a client's context-usage
+				// and subagent tiles for the length of a slow autonomous run. Cap how
+				// long anything sits in `deferred` so it flushes even without a
+				// `message_end`/`agent_end` to release it.
+				let deferredFlushTimer: ReturnType<typeof setTimeout> | undefined;
+				const clearDeferredFlushTimer = () => {
+					if (deferredFlushTimer === undefined) return;
+					clearTimeout(deferredFlushTimer);
+					deferredFlushTimer = undefined;
+				};
+				const flushDeferred = () => {
+					if (mappingState.streaming) return;
+					clearDeferredFlushTimer();
+					for (const held of deferred.splice(0)) void producer.publish(held.update, held.turnId, "event");
+				};
 				const publishUpdate = (update: AcpSessionUpdate, turnId: number) => {
 					if (mappingState.streaming && acpDefersWhileStreaming(update)) {
 						deferred.push({ update, turnId });
+						if (deferredFlushTimer === undefined) {
+							deferredFlushTimer = setTimeout(() => {
+								deferredFlushTimer = undefined;
+								for (const held of deferred.splice(0)) void producer.publish(held.update, held.turnId, "event");
+							}, DEFERRED_TELEMETRY_FLUSH_MS);
+							deferredFlushTimer.unref?.();
+						}
 						return;
 					}
 					void producer.publish(update, turnId, "event");
 				};
-				const flushDeferred = () => {
-					if (mappingState.streaming) return;
-					for (const held of deferred.splice(0)) void producer.publish(held.update, held.turnId, "event");
-				};
-				const unsubscribe = connection.subscribe((event) => {
+				const rawUnsubscribe = connection.subscribe((event) => {
 					// Heartbeats are connection-scoped, including if one races a prompt.
 					// They therefore intentionally use origin turn 0.
 					if (event.type === "heartbeats_changed") {
@@ -974,6 +1035,10 @@ export async function runAcpModeWithConnection(
 					// message left to tear.
 					flushDeferred();
 				});
+				const unsubscribe = () => {
+					rawUnsubscribe();
+					clearDeferredFlushTimer();
+				};
 				try {
 					// Reconcile after subscribing so updates cannot be lost while the snapshot
 					// request is in flight. Do not turn a failed read into an empty roster.
@@ -1034,9 +1099,26 @@ export async function runAcpModeWithConnection(
 			if (sessionCloseInFlight) throw new Error(`ACP session is closing: ${params.sessionId}`);
 			if (entry.cancelling) throw new Error(`ACP session is cancelling: ${params.sessionId}`);
 			await entry.inputPauseRelease?.promise;
-			// A prompt response precedes its correlated terminal update. Serialize the
-			// next turn behind that lifecycle so it cannot overwrite terminal ownership.
-			await entry.pendingTerminal?.task;
+			// The owner's own request has not returned yet when `entry.promptTask` is
+			// still set. Its own `await pending.task` (below) is already grace-bounded,
+			// so queuing behind it here for at most one more grace period preserves
+			// "a follow-up queues behind a turn that has not returned" without an
+			// unbounded wait.
+			if (entry.promptTask) {
+				await withGracePeriod(entry.promptTask, PROMPT_HEADLESS_COMPLETION_GRACE_MS);
+			}
+			// A superseded turn's reconciliation can still be waiting on a fire-and-forget
+			// rlm() child (`finalizePendingTerminal` loops until it settles). Once its owner
+			// has returned (no `entry.promptTask`), a lingering `entry.pendingTerminal` is
+			// genuinely orphaned, not still being published: detach it instead of queuing
+			// behind it, by aborting the pending terminal so its abort-signal checks stop it
+			// before it ever publishes for this now-superseded turn.
+			if (entry.pendingTerminal && !entry.promptTask) {
+				const superseded = entry.pendingTerminal;
+				superseded.abort.abort();
+				if (entry.pendingTerminal === superseded) entry.pendingTerminal = undefined;
+				if (entry.abort === superseded.abort) entry.abort = undefined;
+			}
 			if (session !== entry) throw new Error(`Unknown ACP session: ${params.sessionId}`);
 			if (sessionCloseInFlight) throw new Error(`ACP session is closing: ${params.sessionId}`);
 			// This prompt was admitted before the cancellation started; it is dropped
@@ -1083,7 +1165,11 @@ export async function runAcpModeWithConnection(
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}
-				const status = await connection.waitForHeadlessCompletion();
+				// See `withGracePeriod` for what an expired grace period leaves running.
+				const status = await withGracePeriod(
+					connection.waitForHeadlessCompletion(),
+					PROMPT_HEADLESS_COMPLETION_GRACE_MS,
+				);
 				if (abort.signal.aborted) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
@@ -1101,7 +1187,12 @@ export async function runAcpModeWithConnection(
 				}
 				const outcome = failure ? "error" : "result";
 				let terminalStatus = status;
-				const observedQuiescence = quiescenceMeta(status, liveChildren);
+				// `status` is unknown when the grace period above expired: leave the
+				// quiescence field out rather than invent a status. The already-sent
+				// `terminalQuiescenceExpected: true` on the response boundary below is
+				// the client's existing signal that the authoritative figures are
+				// still coming from `finalizePendingTerminal`.
+				const observedQuiescence = status ? quiescenceMeta(status, liveChildren) : undefined;
 				// The roster is telemetry at the response cut, not proof of terminality:
 				// a child can publish a terminal status before its result reaches the parent.
 				// Every turn therefore finalizes through the strong settlement barrier.
@@ -1119,7 +1210,10 @@ export async function runAcpModeWithConnection(
 				const completionUpdateEmitted = await entry.producer.publish(
 					{
 						sessionUpdate: "session_info_update",
-						_meta: primeAgentMeta({ ...(autonomous ? { autonomous } : {}), quiescence: observedQuiescence }),
+						_meta: primeAgentMeta({
+							...(autonomous ? { autonomous } : {}),
+							...(observedQuiescence ? { quiescence: observedQuiescence } : {}),
+						}),
 					},
 					promptTurnId,
 					"event",
@@ -1131,7 +1225,16 @@ export async function runAcpModeWithConnection(
 					const pending: AcpPendingTerminal = { promptTurnId, boundary: priorMessages, outcome, abort };
 					entry.pendingTerminal = pending;
 					finalizePendingTerminal(entry, pending);
-					await pending.task;
+					// `pending.task` shares the same uncancellable `waitForHeadlessCompletion({
+					// waitForRlmQuiescence: true })` dependency `withGracePeriod` documents: a
+					// fire-and-forget child can hold it open indefinitely. Bound it the same way
+					// so this turn's own response cannot hang behind it. The background task
+					// keeps running and stays owned by `entry.pendingTerminal`, so a later
+					// prompt's detach logic (see the top of this handler) still supersedes it,
+					// and a failure it eventually records still surfaces on the next
+					// `session/prompt` (`entry.pendingTerminal?.failure` above) or on
+					// `session/cancel`/`session/close` (`stopSessionWork`).
+					await withGracePeriod(pending.task!, PROMPT_HEADLESS_COMPLETION_GRACE_MS);
 					terminalSettlementCancelled = abort.signal.aborted;
 					if (pending.failure) {
 						throw new Error(`ACP lifecycle reconciliation failed: ${pending.failure}`);
