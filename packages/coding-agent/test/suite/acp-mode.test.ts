@@ -534,31 +534,121 @@ describe("ACP mode end to end", () => {
 
 		let metadata = updates.map((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
 		expect(metadata.filter((item) => item.phase === "terminalQuiescence")).toHaveLength(0);
+		// A new prompt is detached from the previous turn's reconciliation, not queued
+		// behind it: the barrier above is still held, yet this must settle immediately.
 		const nextPrompt = client.request("session/prompt", {
 			sessionId: session.sessionId,
 			prompt: [{ type: "text", text: "wait for the child" }],
 		});
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		expect(promptCalls).toBe(1);
+		await expect(nextPrompt).resolves.toMatchObject({ stopReason: "end_turn" });
+		expect(promptCalls).toBe(2);
 
 		roster = [{ ...child, status: "done" }];
 		connection.emitChild(roster[0]);
 		releaseBarrier();
-		await vi.waitFor(() => {
-			metadata = updates.map((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
-			expect(metadata.filter((item) => item.phase === "terminalQuiescence" && item.promptTurnId === 1)).toEqual([
-				expect.objectContaining({
-					promptTurnId: 1,
-					outcome: "result",
-					quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
-				}),
-			]);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		// The superseded turn 1 reconciliation resumes once its barrier releases, but
+		// it must never publish a terminal update for a turn a later prompt replaced.
+		metadata = updates.map((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata.filter((item) => item.phase === "terminalQuiescence" && item.promptTurnId === 1)).toHaveLength(0);
+		close();
+	});
+
+	it("does not hang the prompt response on a fire-and-forget child that never idles", async () => {
+		let regularCalls = 0;
+		const connection = fakeAcpConnection({
+			onWaitForHeadlessCompletion: (options) => {
+				if (options?.waitForRlmQuiescence) return;
+				regularCalls++;
+				// A fire-and-forget rlm() child keeps `unfinishedActionCount` above
+				// zero forever from this call's point of view: never resolve, exactly
+				// like the real `waitForHeadlessCompletion` would while a child runs.
+				return new Promise(() => {});
+			},
 		});
-		const sequences = metadata.map((item) => item.eventSequence);
-		expect(sequences).toEqual([...sequences].sort((left, right) => left - right));
-		await expect(firstPrompt).resolves.toBeDefined();
-		await nextPrompt;
-		expect(promptCalls).toBe(2);
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+
+		const result = await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "spawn a child and never wait for it" }],
+		});
+		expect(result.stopReason).toBe("end_turn");
+		expect(regularCalls).toBe(1);
+
+		const metadata = updates.map((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		const boundary = metadata.find((item) => item.phase === "responseBoundary");
+		expect(boundary).toMatchObject({ outcome: "result", terminalQuiescenceExpected: true });
+		// The autonomous status was never observed within the grace period, so the
+		// completion event must not invent a quiescence reading for it.
+		const completionEvent = metadata.find((item) => item.phase === "event" && item.promptTurnId === 1);
+		expect(completionEvent?.quiescence).toBeUndefined();
+		close();
+	}, 5_000);
+
+	it("does not hang the prompt response on a fire-and-forget child the terminal barrier never settles for", async () => {
+		const connection = fakeAcpConnection({
+			onWaitForHeadlessCompletion: (options) => {
+				if (options?.waitForRlmQuiescence) return new Promise(() => {});
+			},
+		});
+		const { client, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+
+		const result = await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "spawn a child the strong barrier never settles for" }],
+		});
+		expect(result.stopReason).toBe("end_turn");
+		close();
+	}, 5_000);
+
+	it("flushes deferred telemetry after a bounded grace period, not only at message_end", async () => {
+		let listener!: (event: any) => void;
+		const connection = fakeAcpConnection();
+		const originalSubscribe = connection.subscribe.bind(connection);
+		connection.subscribe = (callback: (event: any) => void) => {
+			listener = callback;
+			return originalSubscribe(callback);
+		};
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "start a long answer" }],
+		});
+
+		// Open a streaming assistant message and never send its message_end, the
+		// way a slow autonomous run holds one open for a long time.
+		listener({
+			type: "session_event",
+			event: {
+				type: "message_update",
+				message: { role: "assistant", content: [], usage: {} },
+				assistantMessageEvent: { type: "start", contentIndex: 0, partial: {} },
+			},
+		});
+		listener({
+			type: "session_event",
+			event: {
+				type: "message_update",
+				message: { role: "assistant", content: [], usage: {} },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "still typing", partial: {} },
+			},
+		});
+		const child = { id: "child-mid-stream", label: "child", status: "running", sessionDir: "/tmp/child" };
+		listener({ type: "session_event", event: { type: "rlm_child_update", child } });
+
+		const subagentUpdate = () => updates.find((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents);
+		expect(subagentUpdate()).toBeUndefined();
+		await vi.waitFor(() => expect(subagentUpdate()).toBeDefined(), { timeout: 2_000 });
+
+		// Still mid-message: the flush is time-bounded, not message_end-triggered.
+		const textChunks = updates.filter((item) => item.update?.sessionUpdate === "agent_message_chunk");
+		expect(textChunks).toHaveLength(1);
 		close();
 	});
 
