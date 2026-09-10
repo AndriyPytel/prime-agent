@@ -652,6 +652,55 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("holds deferred telemetry while chunks keep coming, and releases it in the first gap", async () => {
+		let listener!: (event: any) => void;
+		const connection = fakeAcpConnection();
+		const originalSubscribe = connection.subscribe.bind(connection);
+		connection.subscribe = (callback: (event: any) => void) => {
+			listener = callback;
+			return originalSubscribe(callback);
+		};
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "start a long answer" }],
+		});
+
+		listener({
+			type: "session_event",
+			event: {
+				type: "message_update",
+				message: { role: "assistant", content: [], usage: {} },
+				assistantMessageEvent: { type: "start", contentIndex: 0, partial: {} },
+			},
+		});
+		const delta = (text: string) =>
+			listener({
+				type: "session_event",
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [], usage: {} },
+					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text, partial: {} },
+				},
+			});
+		delta("still");
+		const child = { id: "child-uninterrupted", label: "child", status: "running", sessionDir: "/tmp/child" };
+		listener({ type: "session_event", event: { type: "rlm_child_update", child } });
+
+		const subagentUpdate = () => updates.find((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents);
+		// Longer than the grace period, but never a gap longer than it.
+		for (let i = 0; i < 6; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			delta(` word${i}`);
+		}
+		expect(subagentUpdate()).toBeUndefined();
+
+		await vi.waitFor(() => expect(subagentUpdate()).toBeDefined(), { timeout: 2_000 });
+		close();
+	}, 10_000);
+
 	it("does not admit the next prompt while terminal settlement is still publishing", async () => {
 		let terminalPublicationStarted!: () => void;
 		let releaseTerminalPublication!: () => void;
