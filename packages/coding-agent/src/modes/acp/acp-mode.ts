@@ -512,7 +512,7 @@ async function turnFailure(connection: AgentConnection, boundary: TurnBoundary):
  */
 const PROMPT_HEADLESS_COMPLETION_GRACE_MS = 3_000;
 
-/** Longest a `session_info_update`/`usage_update` may sit behind a streaming message. */
+/** Longest a `session_info_update`/`usage_update` waits for a gap between chunks before going out anyway. */
 const DEFERRED_TELEMETRY_FLUSH_MS = 500;
 
 /**
@@ -978,14 +978,27 @@ export async function runAcpModeWithConnection(
 				const deferred: Array<{ update: AcpSessionUpdate; turnId: number }> = [];
 				// A long assistant message can hold telemetry for its whole duration,
 				// which is fine for a chunky answer but starves a client's context-usage
-				// and subagent tiles for the length of a slow autonomous run. Cap how
-				// long anything sits in `deferred` so it flushes even without a
-				// `message_end`/`agent_end` to release it.
+				// and subagent tiles for the length of a slow autonomous run. The cap is
+				// therefore on silence, not on the message: every published chunk rearms
+				// it, so what is held goes out in a gap between chunks. A cap on total
+				// hold time fires mid-word instead, and mid-word is exactly what the
+				// deferral exists to prevent — measured on
+				// `~/Library/Logs/JetBrains/WebStorm2026.2/acp/acp.log`, a 500ms total
+				// cap put telemetry between adjacent chunks in 1.2-2.6% of pairs
+				// against 0.2% for the same build without it.
 				let deferredFlushTimer: ReturnType<typeof setTimeout> | undefined;
 				const clearDeferredFlushTimer = () => {
 					if (deferredFlushTimer === undefined) return;
 					clearTimeout(deferredFlushTimer);
 					deferredFlushTimer = undefined;
+				};
+				const armDeferredFlushTimer = () => {
+					clearDeferredFlushTimer();
+					deferredFlushTimer = setTimeout(() => {
+						deferredFlushTimer = undefined;
+						for (const held of deferred.splice(0)) void producer.publish(held.update, held.turnId, "event");
+					}, DEFERRED_TELEMETRY_FLUSH_MS);
+					deferredFlushTimer.unref?.();
 				};
 				const flushDeferred = () => {
 					if (mappingState.streaming) return;
@@ -995,16 +1008,11 @@ export async function runAcpModeWithConnection(
 				const publishUpdate = (update: AcpSessionUpdate, turnId: number) => {
 					if (mappingState.streaming && acpDefersWhileStreaming(update)) {
 						deferred.push({ update, turnId });
-						if (deferredFlushTimer === undefined) {
-							deferredFlushTimer = setTimeout(() => {
-								deferredFlushTimer = undefined;
-								for (const held of deferred.splice(0)) void producer.publish(held.update, held.turnId, "event");
-							}, DEFERRED_TELEMETRY_FLUSH_MS);
-							deferredFlushTimer.unref?.();
-						}
+						armDeferredFlushTimer();
 						return;
 					}
 					void producer.publish(update, turnId, "event");
+					if (deferredFlushTimer !== undefined) armDeferredFlushTimer();
 				};
 				const rawUnsubscribe = connection.subscribe((event) => {
 					if (
