@@ -520,7 +520,7 @@ describe("ACP mode end to end", () => {
 		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
 		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
 		let firstSettled = false;
-		const firstPrompt = client
+		void client
 			.request("session/prompt", {
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "delegate" }],
