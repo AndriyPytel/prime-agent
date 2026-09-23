@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Fixed streamed assistant text and thinking arriving cut mid-word in ACP clients: the daemon and supervisor now queue session events behind socket backpressure instead of dropping them, and fall back to a catch-up resync only past a 32 MB write buffer ([#2498](https://github.com/PrimeIntellect-ai/prime-agent/discussions/2498) by [@AndriyPytel](https://github.com/AndriyPytel)).
+
 ## [0.9.5] - 2026-09-15
 
 - Removed the inactive-session collapse (Alt+I): inactive sessions always render in the agents view, and search remains the filter.
