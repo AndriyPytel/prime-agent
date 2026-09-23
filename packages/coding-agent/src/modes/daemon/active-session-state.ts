@@ -10,11 +10,22 @@ import type {
 } from "./daemon-protocol.js";
 import { formatSessionDisplayId, matchesSessionIdSuffix } from "./daemon-session-id.js";
 
+// ponytail: fixed per-client cap; past it the drop-and-resync path runs, which ACP clients never backfill.
+const MAX_BUFFERED_CLIENT_BYTES = 32 * 1024 * 1024;
+
+/** socket.write still queues under backpressure, so live session frames drop only once that queue is large. */
+export function shouldDropSessionFrame(client: DaemonSocketClient, activeSessionId: string): boolean {
+	if (client.backpressured !== true) return false;
+	// Once a gap exists, keep dropping until the catch-up snapshot replaces it.
+	if (client.catchupActiveSessionIds?.has(activeSessionId)) return true;
+	return (client.socket.writableLength ?? 0) > MAX_BUFFERED_CLIENT_BYTES;
+}
+
 export interface DaemonSocketClient {
 	id: string;
 	socket: Socket;
 	attachedActiveSessionIds: Set<string>;
-	/** Session events are dropped while the socket is blocked and replaced with one catch-up snapshot on drain. */
+	/** Session events dropped past the write-buffer cap, replaced with one catch-up snapshot on drain. */
 	catchupActiveSessionIds?: Set<string>;
 	/** A real runtime replacement takes precedence over an ordinary resync for the same queued catch-up. */
 	catchupPurposes?: Map<string, "replacement" | "resync">;
