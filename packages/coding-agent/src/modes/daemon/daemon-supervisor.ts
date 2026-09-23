@@ -62,7 +62,7 @@ import {
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
-import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
+import { createActiveSessionId, type DaemonSocketClient, shouldDropSessionFrame } from "./active-session-state.js";
 import {
 	AgentRoster,
 	type AgentRosterEntry,
@@ -6047,7 +6047,7 @@ export class DaemonSupervisor {
 				continue;
 			}
 			if (client.deferredSessionPayloadsDropped?.has(activeSessionId)) continue;
-			if (client.backpressured === true) {
+			if (shouldDropSessionFrame(client, activeSessionId)) {
 				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
 				continue;
 			}

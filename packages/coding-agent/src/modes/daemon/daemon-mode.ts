@@ -134,6 +134,7 @@ import {
 	createActiveSessionId,
 	type DaemonSocketClient,
 	resolveActiveSessionState,
+	shouldDropSessionFrame,
 } from "./active-session-state.js";
 import {
 	passivatedWorkerRosterEntry,
@@ -7055,7 +7056,7 @@ export class AgentDaemon {
 				continue;
 			}
 			if (client.deferredSessionFramesDropped?.has(state.activeSessionId)) continue;
-			if (client.backpressured === true) {
+			if (shouldDropSessionFrame(client, state.activeSessionId)) {
 				this.queueClientCatchup(
 					client,
 					state.activeSessionId,

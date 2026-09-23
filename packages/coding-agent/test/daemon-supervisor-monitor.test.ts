@@ -4039,7 +4039,7 @@ describe("daemon worker supervisor monitoring", () => {
 		).rejects.toThrow(`Unknown active session: ${activeSessionId}`);
 	});
 
-	it("catches up only after worker events are skipped behind a backpressured write", async () => {
+	it("catches up only after worker events are skipped behind a full write buffer", async () => {
 		const activeSessionId = "active-backpressure";
 		const writes: string[] = [];
 		const write = vi.fn((data: unknown) => {
@@ -4048,7 +4048,7 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 		const client = {
 			id: "client-1",
-			socket: { destroyed: false, write },
+			socket: { destroyed: false, write, writableLength: 64 * 1024 * 1024 },
 			attachedActiveSessionIds: new Set([activeSessionId]),
 			catchupActiveSessionIds: new Set<string>(),
 			backpressured: false,
@@ -4090,6 +4090,59 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(writes).toHaveLength(1);
 		expect(client.catchupActiveSessionIds).toEqual(new Set([activeSessionId]));
 		expect(catchUpClient).not.toHaveBeenCalled();
+	});
+
+	it("keeps relaying worker events behind a backpressured write until the buffer is full", async () => {
+		const activeSessionId = "active-backpressure";
+		const writes: string[] = [];
+		const write = vi.fn((data: unknown) => {
+			writes.push(String(data));
+			return false;
+		});
+		const client = {
+			id: "client-1",
+			socket: { destroyed: false, write, writableLength: 1024 * 1024 },
+			attachedActiveSessionIds: new Set([activeSessionId]),
+			catchupActiveSessionIds: new Set<string>(),
+			backpressured: false,
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const worker = {
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			duplicateIncomingTranscriptChunkIndexes: new Map(),
+			snapshotTransferFrames: new Map(),
+		};
+		const catchUpClient = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set([client]),
+			streamReconstructor: { observe: vi.fn() },
+			catchUpClient,
+			invalidateWorkerSnapshot: vi.fn(),
+		}) as {
+			handleWorkerFrame(residentWorker: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const frame = (error: string, extensionPath: string): PrivateFrame<DaemonWorkerFrameHeader> => ({
+			header: { kind: "outbound", outboundType: "extension_error", activeSessionId },
+			payload: Buffer.from(
+				`${JSON.stringify({ type: "extension_error", activeSessionId, extensionPath, event: "load", error })}\n`,
+			),
+		});
+
+		supervisor.handleWorkerFrame(worker, frame("first", "x".repeat(1024 * 1024)));
+
+		expect(client.backpressured).toBe(true);
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
+		expect(writes).toHaveLength(1);
+		expect(writes[0]).toContain('"error":"first"');
+
+		supervisor.handleWorkerFrame(worker, frame("buffered", "/tmp/extension.ts"));
+
+		expect(writes).toHaveLength(2);
+		expect(writes[1]).toContain('"error":"buffered"');
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
 	});
 
 	it("subscribes to worker updates with chunked snapshots", async () => {
