@@ -17,8 +17,8 @@ import type {
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionInputPause,
-	AgentConnectionState,
 	AgentConnectionSlashCommand,
+	AgentConnectionState,
 } from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
 import {
