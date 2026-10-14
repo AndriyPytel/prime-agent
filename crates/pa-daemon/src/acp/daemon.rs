@@ -28,6 +28,7 @@ use pa_types::daemon::{
     DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType, DaemonProtocolInfo,
     DaemonResponse, DaemonSessionLifecycle, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION,
 };
+use pa_types::slash_commands::{SlashCommandExecution, SlashCommandRegistry};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -280,6 +281,16 @@ pub(crate) struct HostedSession {
     /// The event mapping state lives and dies with the session, like TS.
     mapping: WireMappingState,
     observed_children: std::collections::HashSet<String>,
+    /// The one-shot `available_commands_update`; dropped with the session.
+    commands_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HostedSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.commands_task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct ActiveTurn {
@@ -1191,6 +1202,7 @@ async fn handle_session_new(
         assistant_stop_reason: None,
         mapping: WireMappingState::default(),
         observed_children: std::collections::HashSet::new(),
+        commands_task: None,
     };
     // The ACP MCP servers ride the wire command, not a local manager.
     let replace_skipped = resolved.is_empty() && state.lock().await.mcp_server_names.is_empty();
@@ -1302,6 +1314,17 @@ async fn handle_session_new(
         }
     }
     let _ = tx.send(jsonrpc::response(&id, &result));
+    {
+        let mut guard = state.lock().await;
+        if let Some(current) = guard.session.as_mut() {
+            current.commands_task = Some(tokio::spawn(announce_commands(
+                Arc::clone(link),
+                current.daemon_active_session_id.clone(),
+                current.acp_session_id.clone(),
+                tx.clone(),
+            )));
+        }
+    }
     if let Some((pause_id, lease_key)) = inherited_pause {
         match release_session_input_pause(link, &binding.active_session_id, &pause_id).await {
             Ok(()) => {
@@ -1741,6 +1764,76 @@ async fn fetch_autonomous_status(
 
 /// The `usage_update` for a `get_state` payload; unknown tokens or an unknown
 /// window report nothing rather than zero.
+/// The session-executed builtins, then connection commands ordered
+/// extension < skill < prompt (the order a submission resolves them), one
+/// entry per name with the first winning.
+fn available_commands(connection_commands: &[Value]) -> Vec<Value> {
+    let source_rank = |command: &Value| match command.get("source").and_then(Value::as_str) {
+        Some("extension") => 0,
+        Some("skill") => 1,
+        _ => 2,
+    };
+    let mut ranked: Vec<&Value> = connection_commands.iter().collect();
+    ranked.sort_by_key(|command| source_rank(command));
+    let builtins = SlashCommandRegistry::builtin_cached()
+        .all()
+        .iter()
+        .filter(|command| command.execution == SlashCommandExecution::Session)
+        .map(|command| (command.name, command.description, command.argument_hint));
+    let connection = ranked.into_iter().filter_map(|command| {
+        Some((
+            command.get("name")?.as_str()?,
+            command
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            command.get("argumentHint").and_then(Value::as_str),
+        ))
+    });
+    let mut seen = std::collections::HashSet::new();
+    builtins
+        .chain(connection)
+        .filter(|(name, _, _)| seen.insert(*name))
+        .map(|(name, description, hint)| {
+            let mut entry = json!({ "name": name, "description": description });
+            if let Some(hint) = hint.filter(|hint| !hint.is_empty()) {
+                entry["input"] = json!({ "hint": hint });
+            }
+            entry
+        })
+        .collect()
+}
+
+async fn announce_commands(
+    link: Arc<DaemonLink>,
+    daemon_session_id: String,
+    acp_session_id: String,
+    tx: producer::FrameSink,
+) {
+    let connection_commands = link
+        .request(DaemonCommand::GetCommands {
+            id: None,
+            active_session_id: daemon_session_id,
+            rest: Map::default(),
+        })
+        .await
+        .ok()
+        .filter(|response| response.success)
+        .and_then(|response| response.data)
+        .and_then(|data| data.get("commands").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let _ = tx.send(jsonrpc::notification(
+        "session/update",
+        &json!({
+            "sessionId": acp_session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": available_commands(&connection_commands),
+            },
+        }),
+    ));
+}
+
 fn changes_context_usage(event: &Value) -> bool {
     match event.get("type").and_then(Value::as_str) {
         Some("compaction_end") => true,
@@ -2057,6 +2150,7 @@ mod tests {
             assistant_stop_reason: None,
             mapping: WireMappingState::default(),
             observed_children: std::collections::HashSet::new(),
+            commands_task: None,
         }
     }
 
@@ -2065,6 +2159,38 @@ mod tests {
             session,
             ..DaemonAcpState::default()
         }
+    }
+
+    #[test]
+    fn available_commands_list_builtins_then_sources_deduped_first_wins() {
+        let commands = available_commands(&[
+            json!({ "name": "p1", "source": "prompt", "description": "p", "argumentHint": "<x>" }),
+            json!({ "name": "skill:s", "source": "skill" }),
+            json!({ "name": "ext", "source": "extension", "description": "e" }),
+            json!({ "name": "compact", "source": "extension" }),
+            json!({ "name": "ext", "source": "prompt" }),
+        ]);
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "compact",
+                "refine",
+                "goal",
+                "autonomous",
+                "ext",
+                "skill:s",
+                "p1"
+            ]
+        );
+        assert_eq!(commands[0]["input"]["hint"], "[instructions]");
+        assert!(commands[1].get("input").is_none());
+        assert_eq!(commands[4]["description"], "e");
+        assert_eq!(commands[5]["description"], "");
+        assert_eq!(commands[6]["input"]["hint"], "<x>");
     }
 
     #[test]
@@ -2163,6 +2289,9 @@ mod tests {
                     }
                     DaemonCommand::GetRlmChildren { .. } => {
                         ("get_rlm_children", Some(json!({ "children": [] })), false)
+                    }
+                    DaemonCommand::GetCommands { .. } => {
+                        ("get_commands", Some(json!({ "commands": [] })), false)
                     }
                     DaemonCommand::ReplaceAcpMcpServers { servers, .. } => {
                         installed = servers
