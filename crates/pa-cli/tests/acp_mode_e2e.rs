@@ -331,6 +331,69 @@ fn acp_second_initialize_is_served() {
 }
 
 #[test]
+fn acp_advertises_session_builtins_once_after_session_new() {
+    let script = json!({ "engine": "faux", "responses": ["ACP-OK"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request("initialize", &initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request("session/new", &json!({ "mcpServers": [] }));
+    let (new_response, before) = client.wait_response(new, TIMEOUT);
+    assert!(
+        before.is_empty(),
+        "nothing precedes the response: {before:?}"
+    );
+    let session_id = new_response["result"]["sessionId"].as_str().unwrap();
+
+    let frame = client.wait_frame(TIMEOUT, |frame| {
+        frame["params"]["update"]["sessionUpdate"] == "available_commands_update"
+    });
+    assert_eq!(frame["params"]["sessionId"], session_id);
+    let commands = frame["params"]["update"]["availableCommands"]
+        .as_array()
+        .unwrap();
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|command| command["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(&names[..4], ["compact", "refine", "goal", "autonomous"]);
+    assert!(!names.contains(&"model") && !names.contains(&"settings"));
+    assert_eq!(commands[0]["input"]["hint"], "[instructions]");
+    assert!(commands[1].get("input").is_none());
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "one entry per name");
+}
+
+#[test]
+fn acp_reports_context_usage_after_the_turn() {
+    let script = json!({ "engine": "faux", "responses": ["ACP-OK"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let session_id = initialize_and_new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "hi" }] }),
+    );
+    let (_, updates) = client.wait_response(prompt, TIMEOUT);
+    let usage = updates
+        .iter()
+        .map(|frame| &frame["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "usage_update")
+        .unwrap_or_else(|| panic!("no usage_update in {updates:?}"));
+    assert!(usage["used"].as_u64().unwrap() > 0);
+    assert!(usage["size"].as_u64().unwrap() > 0);
+    let last_chunk = updates
+        .iter()
+        .rposition(|frame| frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .unwrap();
+    let usage_at = updates
+        .iter()
+        .position(|frame| frame["params"]["update"]["sessionUpdate"] == "usage_update")
+        .unwrap();
+    assert!(usage_at > last_chunk);
+}
+
+#[test]
 fn acp_prompt_stream_completion_envelope_and_stop_reason_match_ts() {
     let script = json!({ "engine": "faux", "responses": ["ACP-OK"] });
     let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
@@ -348,6 +411,15 @@ fn acp_prompt_stream_completion_envelope_and_stop_reason_match_ts() {
         &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "Reply with exactly: ACP-OK" }] }),
     );
     let (prompt_response, updates) = client.wait_response(prompt, TIMEOUT);
+    let updates: Vec<Value> = updates
+        .into_iter()
+        .filter(|frame| {
+            !matches!(
+                frame["params"]["update"]["sessionUpdate"].as_str(),
+                Some("available_commands_update" | "usage_update")
+            )
+        })
+        .collect();
 
     // Frame shape sequence from ts-happy_path.jsonl; the faux provider emits its text in one chunk.
     let mut shapes = Vec::new();
@@ -584,7 +656,12 @@ fn acp_cancel_without_an_active_turn_is_a_noop() {
     client.notify("session/cancel", &json!({ "sessionId": session_id }));
     let close = client.request("session/close", &json!({ "sessionId": session_id }));
     let (close_response, notifications) = client.wait_response(close, TIMEOUT);
-    assert!(notifications.is_empty(), "a no-op cancel publishes nothing");
+    assert!(
+        notifications
+            .iter()
+            .all(|frame| frame["params"]["update"]["sessionUpdate"] == "available_commands_update"),
+        "a no-op cancel publishes nothing"
+    );
     assert_eq!(close_response["result"], json!({}));
 }
 
@@ -891,7 +968,9 @@ fn acp_daemon_attached_cancels_mid_turn() {
     let (prompt_response, updates) = client.wait_response(prompt, Duration::from_mins(1));
     assert_eq!(prompt_response["result"]["stopReason"], "cancelled");
     assert!(
-        updates.is_empty(),
+        updates
+            .iter()
+            .all(|frame| frame["params"]["update"]["sessionUpdate"] == "available_commands_update"),
         "a cancelled turn publishes no boundary frames after the cancel"
     );
     let close = client.request("session/close", &json!({ "sessionId": session_id }));
@@ -2225,6 +2304,22 @@ fn spawn_lane(
     (client, session_id, active_session_id)
 }
 
+/// A fire-and-forget child that never idles must not hang `session/prompt`:
+/// the completion wait and the settle are bounded (TS f830294bf).
+#[test]
+fn acp_prompt_responds_while_a_fire_and_forget_child_never_idles() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 600_000, &kernel_python);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let (prompt_response, _) = client.wait_response(prompt, Duration::from_secs(20));
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+}
+
 /// The ACP settle waits for RLM quiescence (TS #1612): the completion
 /// update reports the live outstanding-subagent count, the terminal update
 /// reports zero, and the settled child's terminal-notice turn ("notice
@@ -2234,7 +2329,7 @@ fn acp_prompt_settles_after_rlm_quiescence() {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
-    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 5_000, &kernel_python);
+    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 1_500, &kernel_python);
     let prompt = client.request(
         "session/prompt",
         &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),

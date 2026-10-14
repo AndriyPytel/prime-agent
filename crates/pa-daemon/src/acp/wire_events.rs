@@ -30,6 +30,7 @@ pub struct WireMappingState {
     ipython_cells: HashMap<String, String>,
     ipython_output: HashMap<String, String>,
     last_child_info: HashMap<String, String>,
+    pub streaming: bool,
 }
 
 impl WireMappingState {
@@ -110,6 +111,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 return Vec::new();
             }
             let message_id = state.message_started();
+            state.streaming = true;
             match stream
                 .and_then(|stream| stream.get("type"))
                 .and_then(Value::as_str)
@@ -133,6 +135,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 == Some("assistant")
             {
                 state.active_assistant_message_id = None;
+                state.streaming = false;
             }
             Vec::new()
         }
@@ -211,6 +214,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
             }]
         }
         "agent_end" => {
+            state.streaming = false;
             state.ipython_cells.clear();
             state.ipython_output.clear();
             Vec::new()
@@ -635,6 +639,45 @@ fn ipython_rich_output(result: Option<&Value>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_spans_the_first_chunk_to_the_assistant_message_end() {
+        let mut state = WireMappingState::default();
+        let delta = json!({
+            "type": "message_update",
+            "message": { "role": "assistant" },
+            "assistantMessageEvent": { "type": "text_delta", "delta": "hi" },
+        });
+        assert!(!state.streaming);
+        wire_updates(&delta, &mut state);
+        assert!(state.streaming);
+        wire_updates(
+            &json!({ "type": "message_end", "message": { "role": "user" } }),
+            &mut state,
+        );
+        assert!(state.streaming);
+        wire_updates(
+            &json!({ "type": "message_end", "message": { "role": "assistant" } }),
+            &mut state,
+        );
+        assert!(!state.streaming);
+    }
+
+    #[test]
+    fn agent_end_closes_a_message_a_cancelled_run_left_open() {
+        let mut state = WireMappingState::default();
+        wire_updates(
+            &json!({
+                "type": "message_update",
+                "message": { "role": "assistant" },
+                "assistantMessageEvent": { "type": "text_delta", "delta": "hi" },
+            }),
+            &mut state,
+        );
+        assert!(state.streaming);
+        wire_updates(&json!({ "type": "agent_end" }), &mut state);
+        assert!(!state.streaming);
+    }
 
     #[test]
     fn assistant_deltas_map_to_chunks() {

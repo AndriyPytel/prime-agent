@@ -23,11 +23,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pa_types::daemon::{
     DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType, DaemonProtocolInfo,
     DaemonResponse, DaemonSessionLifecycle, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION,
 };
+use pa_types::slash_commands::{SlashCommandExecution, SlashCommandRegistry};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -280,6 +282,22 @@ pub(crate) struct HostedSession {
     /// The event mapping state lives and dies with the session, like TS.
     mapping: WireMappingState,
     observed_children: std::collections::HashSet<String>,
+    /// The one-shot `available_commands_update`; dropped with the session.
+    commands_task: Option<tokio::task::JoinHandle<()>>,
+    /// The settle task of a prompt that answered before the family went
+    /// quiet; the next admission aborts it.
+    pending_terminal: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for HostedSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.commands_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.pending_terminal.take() {
+            task.abort();
+        }
+    }
 }
 
 struct ActiveTurn {
@@ -350,6 +368,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                         // the guard, spawned once released.
                         let mut refresh: Option<(Arc<HostedConfig>, Arc<UpdateProducer>, String)> =
                             None;
+                        let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
                         {
                             let mut guard = state.lock().await;
                             let Some(current) = guard.session.as_mut() else {
@@ -370,10 +389,21 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             }
                             let turn_id = current.producer.active_prompt_turn().await;
                             for update in wire_events::wire_updates(&event, &mut current.mapping) {
-                                let _ = current
+                                current
                                     .producer
-                                    .publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
+                                    .publish_event(&update, turn_id, current.mapping.streaming)
                                     .await;
+                            }
+                            current
+                                .producer
+                                .flush_deferred(current.mapping.streaming)
+                                .await;
+                            if changes_context_usage(&event) {
+                                usage_fetch = Some((
+                                    Arc::clone(&current.producer),
+                                    current.daemon_active_session_id.clone(),
+                                    turn_id,
+                                ));
                             }
                             if matches!(
                                 event.get("type").and_then(Value::as_str),
@@ -385,6 +415,20 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                                     current.daemon_active_session_id.clone(),
                                 ));
                             }
+                        }
+                        if let Some((producer, daemon_session_id, turn_id)) = usage_fetch {
+                            let link = Arc::clone(&link);
+                            let state = Arc::clone(&state);
+                            tokio::spawn(async move {
+                                publish_usage_update(
+                                    &link,
+                                    &state,
+                                    &daemon_session_id,
+                                    &producer,
+                                    turn_id,
+                                )
+                                .await;
+                            });
                         }
                         if let Some((config, producer, daemon_session_id)) = refresh {
                             let link = Arc::clone(&link);
@@ -415,9 +459,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                     LinkFrame::HeartbeatsChanged => {
                         let guard = state.lock().await;
                         if let Some(current) = guard.session.as_ref() {
-                            let _ = current
+                            current
                                 .producer
-                                .publish(
+                                .publish_event(
                                     &types::AcpSessionUpdate::SessionInfoUpdate {
                                         meta: meta::prime_agent_meta(&PrimeAgentSessionMeta {
                                             heartbeats_changed: Some(true),
@@ -425,8 +469,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                                         }),
                                     },
                                     0,
-                                    PrimeAgentEventPhase::Event,
-                                    None,
+                                    current.mapping.streaming,
                                 )
                                 .await;
                         }
@@ -735,6 +778,9 @@ async fn admit_prompt(
     }
     if hosted.turn.is_some() {
         return Err("A prompt turn is already running for this ACP session".to_string());
+    }
+    if let Some(orphan) = hosted.pending_terminal.take() {
+        orphan.abort();
     }
     let admission_id = format!("prompt-admission:{}", uuid::Uuid::new_v4());
     // The stop reason is per-turn: a turn that runs no model call (a
@@ -1166,6 +1212,8 @@ async fn handle_session_new(
         assistant_stop_reason: None,
         mapping: WireMappingState::default(),
         observed_children: std::collections::HashSet::new(),
+        commands_task: None,
+        pending_terminal: None,
     };
     // The ACP MCP servers ride the wire command, not a local manager.
     let replace_skipped = resolved.is_empty() && state.lock().await.mcp_server_names.is_empty();
@@ -1277,6 +1325,17 @@ async fn handle_session_new(
         }
     }
     let _ = tx.send(jsonrpc::response(&id, &result));
+    {
+        let mut guard = state.lock().await;
+        if let Some(current) = guard.session.as_mut() {
+            current.commands_task = Some(tokio::spawn(announce_commands(
+                Arc::clone(link),
+                current.daemon_active_session_id.clone(),
+                current.acp_session_id.clone(),
+                tx.clone(),
+            )));
+        }
+    }
     if let Some((pause_id, lease_key)) = inherited_pause {
         match release_session_input_pause(link, &binding.active_session_id, &pause_id).await {
             Ok(()) => {
@@ -1387,6 +1446,17 @@ fn turn_cancelled(state: &DaemonAcpState, admission_id: &str) -> bool {
         .as_ref()
         .and_then(|hosted| hosted.turn.as_ref())
         .is_some_and(|turn| turn.admission_id == admission_id && !turn.cancelled)
+}
+
+/// Like [`turn_cancelled`], but a released slot is not a cancel: the settle
+/// outlives a prompt that answered at the grace.
+fn settle_cancelled(state: &DaemonAcpState, admission_id: &str) -> bool {
+    state.session.as_ref().is_none_or(|hosted| {
+        hosted
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.admission_id == admission_id && turn.cancelled)
+    })
 }
 
 fn cancelled_response(id: &Value) -> Value {
@@ -1514,9 +1584,13 @@ async fn prompt_turn(
     // after the turn settled (the response is the run's end). A failed
     // fetch degrades to no autonomous meta (the envelope still settles
     // without a run).
-    let autonomous_status = fetch_autonomous_status(link, &hosted_daemon_session_id, false)
-        .await
-        .ok();
+    let completion_wait = tokio::time::timeout(
+        PROMPT_SETTLE_GRACE,
+        fetch_autonomous_status(link, &hosted_daemon_session_id, false),
+    )
+    .await;
+    let completion_expired = completion_wait.is_err();
+    let autonomous_status = completion_wait.ok().and_then(Result::ok);
     // TS `abort.signal.aborted` after `waitForHeadlessCompletion`: queued
     // continuations (goal, post-compaction autonomous) run inside that wait.
     if turn_cancelled(&*state.lock().await, admission_id) {
@@ -1564,46 +1638,122 @@ async fn prompt_turn(
     let quiescence = types::AcpSessionUpdate::SessionInfoUpdate {
         meta: meta::prime_agent_meta(&PrimeAgentSessionMeta {
             autonomous: autonomous_meta,
-            quiescence: Some(quiescence_meta(autonomous_status.as_ref(), &children)),
+            quiescence: (!completion_expired)
+                .then(|| quiescence_meta(autonomous_status.as_ref(), &children)),
             ..Default::default()
         }),
     };
     let completion_published = producer
         .publish(&quiescence, turn_id, PrimeAgentEventPhase::Event, None)
         .await;
-    // The settlement loop (TS `finalizePendingTerminal`): the barrier is
-    // the event, no timer, and the roster re-read is the response-cut
-    // telemetry (a child can publish a terminal status before its result
-    // reaches the parent). A failed barrier or read errors the prompt; a
-    // degraded status would spin the loop.
-    let settled_status = loop {
-        let status = match fetch_autonomous_status(link, &hosted_daemon_session_id, true).await {
+    // The settlement loop (TS `finalizePendingTerminal`) runs as the pending
+    // terminal: the prompt waits a bounded grace for it and, if the family
+    // is still not quiet, answers while the task keeps running until the
+    // next admission aborts it.
+    let mut settle = tokio::spawn(settle_terminal(
+        Arc::clone(link),
+        Arc::clone(state),
+        Arc::clone(&producer),
+        hosted_daemon_session_id.clone(),
+        admission_id.to_string(),
+        turn_id,
+        published && completion_published,
+    ));
+    if let Some(hosted) = state
+        .lock()
+        .await
+        .session
+        .as_mut()
+        .filter(|hosted| Arc::ptr_eq(&hosted.producer, &producer))
+    {
+        hosted.pending_terminal = Some(settle.abort_handle());
+    }
+    let settled_status = match tokio::time::timeout(PROMPT_SETTLE_GRACE, &mut settle).await {
+        Err(_) => None,
+        Ok(joined) => {
+            if let Some(hosted) = state.lock().await.session.as_mut() {
+                hosted.pending_terminal = None;
+            }
+            match joined {
+                Ok(SettleOutcome::Settled(status)) => Some(*status),
+                Ok(SettleOutcome::Failed(message)) => {
+                    return super::internal_error(&id, &message);
+                }
+                Ok(SettleOutcome::Cancelled) | Err(_) => return cancelled_response(&id),
+            }
+        }
+    };
+    // The stop reason follows the TS mapping (acp-stop-reason.ts) plus the
+    // turn's final assistant stop reason (#3363): the abort flag read after
+    // the settlement, the settlement's status (`pending.status`), not the
+    // first observation's, and the newest assistant stop reason — the link's
+    // one frame consumer applies every message_end (the autonomous
+    // continuations' included, since they run inside the waits above) before
+    // the response that ended each wait resolved, so this read after the
+    // settlement sees the run's final one.
+    let (cancelled, assistant_stop_reason) = {
+        let guard = state.lock().await;
+        (
+            turn_cancelled(&guard, admission_id),
+            guard
+                .session
+                .as_ref()
+                .and_then(|hosted| hosted.assistant_stop_reason),
+        )
+    };
+    let stop_reason = meta::acp_stop_reason_for_status(
+        cancelled,
+        settled_status.as_ref().or(autonomous_status.as_ref()),
+        assistant_stop_reason,
+    );
+    jsonrpc::response(
+        &id,
+        &serde_json::to_value(types::AcpStopReasonResponse { stop_reason }).expect("serializes"),
+    )
+}
+
+const PROMPT_SETTLE_GRACE: Duration = Duration::from_secs(3);
+
+enum SettleOutcome {
+    Settled(Box<pa_core::autonomous::AgentAutonomousStatus>),
+    Cancelled,
+    Failed(String),
+}
+
+async fn settle_terminal(
+    link: Arc<DaemonLink>,
+    state: Arc<Mutex<DaemonAcpState>>,
+    producer: Arc<UpdateProducer>,
+    daemon_session_id: String,
+    admission_id: String,
+    turn_id: u64,
+    boundary_published: bool,
+) -> SettleOutcome {
+    let reconciliation_failed = |error: anyhow::Error| {
+        SettleOutcome::Failed(format!("ACP lifecycle reconciliation failed: {error}"))
+    };
+    loop {
+        let status = match fetch_autonomous_status(&link, &daemon_session_id, true).await {
             Ok(status) => status,
             Err(error) => {
                 producer.finish_prompt(turn_id).await;
-                return super::internal_error(
-                    &id,
-                    &format!("ACP lifecycle reconciliation failed: {error}"),
-                );
+                return reconciliation_failed(error);
             }
         };
-        if turn_cancelled(&*state.lock().await, admission_id) {
+        if settle_cancelled(&*state.lock().await, &admission_id) {
             producer.finish_prompt(turn_id).await;
-            return cancelled_response(&id);
+            return SettleOutcome::Cancelled;
         }
-        let children = match fetch_rlm_children(link, &hosted_daemon_session_id).await {
+        let children = match fetch_rlm_children(&link, &daemon_session_id).await {
             Ok(children) => children,
             Err(error) => {
                 producer.finish_prompt(turn_id).await;
-                return super::internal_error(
-                    &id,
-                    &format!("ACP lifecycle reconciliation failed: {error}"),
-                );
+                return reconciliation_failed(error);
             }
         };
-        if turn_cancelled(&*state.lock().await, admission_id) {
+        if settle_cancelled(&*state.lock().await, &admission_id) {
             producer.finish_prompt(turn_id).await;
-            return cancelled_response(&id);
+            return SettleOutcome::Cancelled;
         }
         let terminal_quiescence = quiescence_meta(Some(&status), &children);
         if terminal_quiescence.outstanding_subagents != 0 {
@@ -1627,35 +1777,11 @@ async fn prompt_turn(
                 Some(PrimeAgentOutcome::Result),
             )
             .await;
-        if !published || !completion_published || !terminal_published {
-            return super::internal_error(&id, "Failed to publish ACP completion");
+        if !boundary_published || !terminal_published {
+            return SettleOutcome::Failed("Failed to publish ACP completion".to_string());
         }
-        break status;
-    };
-    // The stop reason follows the TS mapping (acp-stop-reason.ts) plus the
-    // turn's final assistant stop reason (#3363): the abort flag read after
-    // the settlement, the settlement's status (`pending.status`), not the
-    // first observation's, and the newest assistant stop reason — the link's
-    // one frame consumer applies every message_end (the autonomous
-    // continuations' included, since they run inside the waits above) before
-    // the response that ended each wait resolved, so this read after the
-    // settlement sees the run's final one.
-    let (cancelled, assistant_stop_reason) = {
-        let guard = state.lock().await;
-        (
-            turn_cancelled(&guard, admission_id),
-            guard
-                .session
-                .as_ref()
-                .and_then(|hosted| hosted.assistant_stop_reason),
-        )
-    };
-    let stop_reason =
-        meta::acp_stop_reason_for_status(cancelled, Some(&settled_status), assistant_stop_reason);
-    jsonrpc::response(
-        &id,
-        &serde_json::to_value(types::AcpStopReasonResponse { stop_reason }).expect("serializes"),
-    )
+        return SettleOutcome::Settled(Box::new(status));
+    }
 }
 
 /// The error boundary a failed turn publishes (TS
@@ -1712,6 +1838,142 @@ async fn fetch_autonomous_status(
     Ok(serde_json::from_value(
         response.data.unwrap_or(Value::Null),
     )?)
+}
+
+/// The `usage_update` for a `get_state` payload; unknown tokens or an unknown
+/// window report nothing rather than zero.
+/// The session-executed builtins, then connection commands ordered
+/// extension < skill < prompt (the order a submission resolves them), one
+/// entry per name with the first winning.
+fn available_commands(connection_commands: &[Value]) -> Vec<Value> {
+    let source_rank = |command: &Value| match command.get("source").and_then(Value::as_str) {
+        Some("extension") => 0,
+        Some("skill") => 1,
+        _ => 2,
+    };
+    let mut ranked: Vec<&Value> = connection_commands.iter().collect();
+    ranked.sort_by_key(|command| source_rank(command));
+    let builtins = SlashCommandRegistry::builtin_cached()
+        .all()
+        .iter()
+        .filter(|command| command.execution == SlashCommandExecution::Session)
+        .map(|command| (command.name, command.description, command.argument_hint));
+    let connection = ranked.into_iter().filter_map(|command| {
+        Some((
+            command.get("name")?.as_str()?,
+            command
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            command.get("argumentHint").and_then(Value::as_str),
+        ))
+    });
+    let mut seen = std::collections::HashSet::new();
+    builtins
+        .chain(connection)
+        .filter(|(name, _, _)| seen.insert(*name))
+        .map(|(name, description, hint)| {
+            let mut entry = json!({ "name": name, "description": description });
+            if let Some(hint) = hint.filter(|hint| !hint.is_empty()) {
+                entry["input"] = json!({ "hint": hint });
+            }
+            entry
+        })
+        .collect()
+}
+
+async fn announce_commands(
+    link: Arc<DaemonLink>,
+    daemon_session_id: String,
+    acp_session_id: String,
+    tx: producer::FrameSink,
+) {
+    let connection_commands = link
+        .request(DaemonCommand::GetCommands {
+            id: None,
+            active_session_id: daemon_session_id,
+            rest: Map::default(),
+        })
+        .await
+        .ok()
+        .filter(|response| response.success)
+        .and_then(|response| response.data)
+        .and_then(|data| data.get("commands").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let _ = tx.send(jsonrpc::notification(
+        "session/update",
+        &json!({
+            "sessionId": acp_session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": available_commands(&connection_commands),
+            },
+        }),
+    ));
+}
+
+fn changes_context_usage(event: &Value) -> bool {
+    match event.get("type").and_then(Value::as_str) {
+        Some("compaction_end") => true,
+        Some("message_end") => {
+            event
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+        }
+        _ => false,
+    }
+}
+
+fn usage_update(state: &Value) -> Option<types::AcpSessionUpdate> {
+    let usage = state.get("contextUsage")?;
+    let used = usage.get("tokens")?.as_u64()?;
+    let size = usage
+        .get("contextWindow")?
+        .as_u64()
+        .filter(|size| *size > 0)?;
+    Some(types::AcpSessionUpdate::UsageUpdate { used, size })
+}
+
+async fn publish_usage_update(
+    link: &Arc<DaemonLink>,
+    state: &Arc<Mutex<DaemonAcpState>>,
+    daemon_session_id: &str,
+    producer: &Arc<UpdateProducer>,
+    turn_id: u64,
+) {
+    let Ok(response) = link
+        .request(DaemonCommand::GetConnectionState {
+            id: None,
+            active_session_id: daemon_session_id.to_string(),
+            rest: Map::default(),
+        })
+        .await
+    else {
+        return;
+    };
+    let Some(update) = response
+        .success
+        .then_some(response.data)
+        .flatten()
+        .as_ref()
+        .and_then(usage_update)
+    else {
+        return;
+    };
+    let guard = state.lock().await;
+    let Some(current) = guard
+        .session
+        .as_ref()
+        .filter(|current| Arc::ptr_eq(&current.producer, producer))
+    else {
+        return;
+    };
+    producer
+        .publish_event(&update, turn_id, current.mapping.streaming)
+        .await;
+    producer.flush_deferred(current.mapping.streaming).await;
 }
 
 /// The live child roster (`get_rlm_children` on the daemon wire; TS
@@ -1966,6 +2228,8 @@ mod tests {
             assistant_stop_reason: None,
             mapping: WireMappingState::default(),
             observed_children: std::collections::HashSet::new(),
+            commands_task: None,
+            pending_terminal: None,
         }
     }
 
@@ -1974,6 +2238,59 @@ mod tests {
             session,
             ..DaemonAcpState::default()
         }
+    }
+
+    #[test]
+    fn available_commands_list_builtins_then_sources_deduped_first_wins() {
+        let commands = available_commands(&[
+            json!({ "name": "p1", "source": "prompt", "description": "p", "argumentHint": "<x>" }),
+            json!({ "name": "skill:s", "source": "skill" }),
+            json!({ "name": "ext", "source": "extension", "description": "e" }),
+            json!({ "name": "compact", "source": "extension" }),
+            json!({ "name": "ext", "source": "prompt" }),
+        ]);
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "compact",
+                "refine",
+                "goal",
+                "autonomous",
+                "ext",
+                "skill:s",
+                "p1"
+            ]
+        );
+        assert_eq!(commands[0]["input"]["hint"], "[instructions]");
+        assert!(commands[1].get("input").is_none());
+        assert_eq!(commands[4]["description"], "e");
+        assert_eq!(commands[5]["description"], "");
+        assert_eq!(commands[6]["input"]["hint"], "<x>");
+    }
+
+    #[test]
+    fn usage_update_needs_known_tokens_and_a_positive_window() {
+        let state = |usage: Value| json!({ "contextUsage": usage });
+        assert_eq!(
+            usage_update(&state(json!({ "tokens": 12, "contextWindow": 100 }))),
+            Some(types::AcpSessionUpdate::UsageUpdate {
+                used: 12,
+                size: 100
+            })
+        );
+        assert_eq!(
+            usage_update(&state(json!({ "tokens": null, "contextWindow": 100 }))),
+            None
+        );
+        assert_eq!(
+            usage_update(&state(json!({ "tokens": 12, "contextWindow": 0 }))),
+            None
+        );
+        assert_eq!(usage_update(&json!({})), None);
     }
 
     #[tokio::test]
@@ -2052,6 +2369,9 @@ mod tests {
                     DaemonCommand::GetRlmChildren { .. } => {
                         ("get_rlm_children", Some(json!({ "children": [] })), false)
                     }
+                    DaemonCommand::GetCommands { .. } => {
+                        ("get_commands", Some(json!({ "commands": [] })), false)
+                    }
                     DaemonCommand::ReplaceAcpMcpServers { servers, .. } => {
                         installed = servers
                             .as_array()
@@ -2123,6 +2443,26 @@ mod tests {
         let (replacements, installed) = worker.await.unwrap();
         assert_eq!(replacements, vec![vec!["example"], vec![], vec![]]);
         assert!(installed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admitting_a_prompt_aborts_an_orphaned_pending_terminal() {
+        let mut session = hosted_session();
+        let orphan = tokio::spawn(std::future::pending::<()>());
+        session.pending_terminal = Some(orphan.abort_handle());
+        let state = Arc::new(Mutex::new(state(Some(session))));
+        admit_prompt(&json!({ "sessionId": "acp-1" }), &state)
+            .await
+            .expect("admitted");
+        assert!(orphan.await.unwrap_err().is_cancelled());
+        assert!(state
+            .lock()
+            .await
+            .session
+            .as_ref()
+            .unwrap()
+            .pending_terminal
+            .is_none());
     }
 
     #[tokio::test]
