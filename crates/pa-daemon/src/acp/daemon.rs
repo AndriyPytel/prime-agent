@@ -350,6 +350,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                         // the guard, spawned once released.
                         let mut refresh: Option<(Arc<HostedConfig>, Arc<UpdateProducer>, String)> =
                             None;
+                        let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
                         {
                             let mut guard = state.lock().await;
                             let Some(current) = guard.session.as_mut() else {
@@ -370,10 +371,21 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             }
                             let turn_id = current.producer.active_prompt_turn().await;
                             for update in wire_events::wire_updates(&event, &mut current.mapping) {
-                                let _ = current
+                                current
                                     .producer
-                                    .publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
+                                    .publish_event(&update, turn_id, current.mapping.streaming)
                                     .await;
+                            }
+                            current
+                                .producer
+                                .flush_deferred(current.mapping.streaming)
+                                .await;
+                            if changes_context_usage(&event) {
+                                usage_fetch = Some((
+                                    Arc::clone(&current.producer),
+                                    current.daemon_active_session_id.clone(),
+                                    turn_id,
+                                ));
                             }
                             if matches!(
                                 event.get("type").and_then(Value::as_str),
@@ -385,6 +397,20 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                                     current.daemon_active_session_id.clone(),
                                 ));
                             }
+                        }
+                        if let Some((producer, daemon_session_id, turn_id)) = usage_fetch {
+                            let link = Arc::clone(&link);
+                            let state = Arc::clone(&state);
+                            tokio::spawn(async move {
+                                publish_usage_update(
+                                    &link,
+                                    &state,
+                                    &daemon_session_id,
+                                    &producer,
+                                    turn_id,
+                                )
+                                .await;
+                            });
                         }
                         if let Some((config, producer, daemon_session_id)) = refresh {
                             let link = Arc::clone(&link);
@@ -415,9 +441,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                     LinkFrame::HeartbeatsChanged => {
                         let guard = state.lock().await;
                         if let Some(current) = guard.session.as_ref() {
-                            let _ = current
+                            current
                                 .producer
-                                .publish(
+                                .publish_event(
                                     &types::AcpSessionUpdate::SessionInfoUpdate {
                                         meta: meta::prime_agent_meta(&PrimeAgentSessionMeta {
                                             heartbeats_changed: Some(true),
@@ -425,8 +451,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                                         }),
                                     },
                                     0,
-                                    PrimeAgentEventPhase::Event,
-                                    None,
+                                    current.mapping.streaming,
                                 )
                                 .await;
                         }
@@ -1714,6 +1739,72 @@ async fn fetch_autonomous_status(
     )?)
 }
 
+/// The `usage_update` for a `get_state` payload; unknown tokens or an unknown
+/// window report nothing rather than zero.
+fn changes_context_usage(event: &Value) -> bool {
+    match event.get("type").and_then(Value::as_str) {
+        Some("compaction_end") => true,
+        Some("message_end") => {
+            event
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+        }
+        _ => false,
+    }
+}
+
+fn usage_update(state: &Value) -> Option<types::AcpSessionUpdate> {
+    let usage = state.get("contextUsage")?;
+    let used = usage.get("tokens")?.as_u64()?;
+    let size = usage
+        .get("contextWindow")?
+        .as_u64()
+        .filter(|size| *size > 0)?;
+    Some(types::AcpSessionUpdate::UsageUpdate { used, size })
+}
+
+async fn publish_usage_update(
+    link: &Arc<DaemonLink>,
+    state: &Arc<Mutex<DaemonAcpState>>,
+    daemon_session_id: &str,
+    producer: &Arc<UpdateProducer>,
+    turn_id: u64,
+) {
+    let Ok(response) = link
+        .request(DaemonCommand::GetConnectionState {
+            id: None,
+            active_session_id: daemon_session_id.to_string(),
+            rest: Map::default(),
+        })
+        .await
+    else {
+        return;
+    };
+    let Some(update) = response
+        .success
+        .then_some(response.data)
+        .flatten()
+        .as_ref()
+        .and_then(usage_update)
+    else {
+        return;
+    };
+    let guard = state.lock().await;
+    let Some(current) = guard
+        .session
+        .as_ref()
+        .filter(|current| Arc::ptr_eq(&current.producer, producer))
+    else {
+        return;
+    };
+    producer
+        .publish_event(&update, turn_id, current.mapping.streaming)
+        .await;
+    producer.flush_deferred(current.mapping.streaming).await;
+}
+
 /// The live child roster (`get_rlm_children` on the daemon wire; TS
 /// `getRlmChildSnapshots` throws).
 ///
@@ -1974,6 +2065,27 @@ mod tests {
             session,
             ..DaemonAcpState::default()
         }
+    }
+
+    #[test]
+    fn usage_update_needs_known_tokens_and_a_positive_window() {
+        let state = |usage: Value| json!({ "contextUsage": usage });
+        assert_eq!(
+            usage_update(&state(json!({ "tokens": 12, "contextWindow": 100 }))),
+            Some(types::AcpSessionUpdate::UsageUpdate {
+                used: 12,
+                size: 100
+            })
+        );
+        assert_eq!(
+            usage_update(&state(json!({ "tokens": null, "contextWindow": 100 }))),
+            None
+        );
+        assert_eq!(
+            usage_update(&state(json!({ "tokens": 12, "contextWindow": 0 }))),
+            None
+        );
+        assert_eq!(usage_update(&json!({})), None);
     }
 
     #[tokio::test]

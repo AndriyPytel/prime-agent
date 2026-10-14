@@ -331,6 +331,34 @@ fn acp_second_initialize_is_served() {
 }
 
 #[test]
+fn acp_reports_context_usage_after_the_turn() {
+    let script = json!({ "engine": "faux", "responses": ["ACP-OK"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let session_id = initialize_and_new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "hi" }] }),
+    );
+    let (_, updates) = client.wait_response(prompt, TIMEOUT);
+    let usage = updates
+        .iter()
+        .map(|frame| &frame["params"]["update"])
+        .find(|update| update["sessionUpdate"] == "usage_update")
+        .unwrap_or_else(|| panic!("no usage_update in {updates:?}"));
+    assert!(usage["used"].as_u64().unwrap() > 0);
+    assert!(usage["size"].as_u64().unwrap() > 0);
+    let last_chunk = updates
+        .iter()
+        .rposition(|frame| frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .unwrap();
+    let usage_at = updates
+        .iter()
+        .position(|frame| frame["params"]["update"]["sessionUpdate"] == "usage_update")
+        .unwrap();
+    assert!(usage_at > last_chunk);
+}
+
+#[test]
 fn acp_prompt_stream_completion_envelope_and_stop_reason_match_ts() {
     let script = json!({ "engine": "faux", "responses": ["ACP-OK"] });
     let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);

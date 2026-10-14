@@ -175,6 +175,9 @@ pub enum AcpSessionUpdate {
         #[serde(rename = "_meta")]
         meta: Value,
     },
+    /// Context window occupancy after an assistant message or compaction.
+    #[serde(rename = "usage_update")]
+    UsageUpdate { used: u64, size: u64 },
     /// The session's configuration options changed (TS #2455): the
     /// full set with current values, connection-scoped.
     #[serde(rename = "config_option_update")]

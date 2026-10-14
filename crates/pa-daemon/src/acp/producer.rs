@@ -5,6 +5,7 @@
 //! response is queued are held and released after it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
@@ -21,6 +22,10 @@ use serde_json::{json, Value};
 /// publication order.
 pub type FrameSink = tokio::sync::mpsc::UnboundedSender<Value>;
 
+/// Quiet time after the last published update before held telemetry is
+/// released without waiting for the message to end.
+const DEFERRED_TELEMETRY_FLUSH: Duration = Duration::from_millis(500);
+
 pub struct UpdateProducer {
     session_id: String,
     sink: FrameSink,
@@ -33,6 +38,9 @@ struct ProducerState {
     next_prompt_turn_id: u64,
     active_prompt_turn_id: u64,
     admission: AdmissionState,
+    /// Telemetry held while a message streams, with its own turn ids.
+    deferred: Vec<(AcpSessionUpdate, u64)>,
+    flush_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +112,71 @@ impl UpdateProducer {
         let mut state = self.state.lock().await;
         state.admission.mode = AdmissionMode::Closed;
         state.admission.held.clear();
+        state.deferred.clear();
+        if let Some(timer) = state.flush_timer.take() {
+            timer.abort();
+        }
+    }
+
+    /// Publish an event-driven update, holding telemetry (session info and
+    /// usage) while a message streams so it cannot split the answer.
+    pub async fn publish_event(
+        self: &Arc<Self>,
+        update: &AcpSessionUpdate,
+        turn_id: u64,
+        streaming: bool,
+    ) {
+        if streaming
+            && matches!(
+                update,
+                AcpSessionUpdate::SessionInfoUpdate { .. } | AcpSessionUpdate::UsageUpdate { .. }
+            )
+        {
+            let mut state = self.state.lock().await;
+            state.deferred.push((update.clone(), turn_id));
+            self.arm_flush_timer(&mut state);
+            return;
+        }
+        self.publish(update, turn_id, PrimeAgentEventPhase::Event, None)
+            .await;
+        let mut state = self.state.lock().await;
+        if state.flush_timer.is_some() {
+            self.arm_flush_timer(&mut state);
+        }
+    }
+
+    /// Release held telemetry in arrival order once no message streams.
+    pub async fn flush_deferred(self: &Arc<Self>, streaming: bool) {
+        if !streaming {
+            self.release_deferred(true).await;
+        }
+    }
+
+    async fn release_deferred(&self, abort_timer: bool) {
+        let held = {
+            let mut state = self.state.lock().await;
+            if let Some(timer) = state.flush_timer.take() {
+                if abort_timer {
+                    timer.abort();
+                }
+            }
+            std::mem::take(&mut state.deferred)
+        };
+        for (update, turn_id) in held {
+            self.publish(&update, turn_id, PrimeAgentEventPhase::Event, None)
+                .await;
+        }
+    }
+
+    fn arm_flush_timer(self: &Arc<Self>, state: &mut ProducerState) {
+        if let Some(timer) = state.flush_timer.take() {
+            timer.abort();
+        }
+        let producer = Arc::clone(self);
+        state.flush_timer = Some(tokio::spawn(async move {
+            tokio::time::sleep(DEFERRED_TELEMETRY_FLUSH).await;
+            producer.release_deferred(false).await;
+        }));
     }
 
     /// Publish one update with its correlation fields. Returns `false` when
@@ -179,5 +252,83 @@ impl UpdateProducer {
 
     fn send(&self, frame: Value) {
         let _ = self.sink.send(frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn chunk() -> AcpSessionUpdate {
+        AcpSessionUpdate::AgentMessageChunk {
+            message_id: "m".into(),
+            content: super::super::types::TextBlock::new("x"),
+        }
+    }
+
+    fn usage() -> AcpSessionUpdate {
+        AcpSessionUpdate::UsageUpdate { used: 1, size: 2 }
+    }
+
+    fn info() -> AcpSessionUpdate {
+        AcpSessionUpdate::SessionInfoUpdate {
+            meta: json!({ "k": 1 }),
+        }
+    }
+
+    async fn open_producer() -> (
+        Arc<UpdateProducer>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let producer = UpdateProducer::new("s", tx);
+        producer.commit_session_new_response().await;
+        (producer, rx)
+    }
+
+    fn kinds(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+        let mut kinds = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            kinds.push(
+                frame["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        kinds
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_is_held_while_streaming_and_released_in_order() {
+        let (producer, mut rx) = open_producer().await;
+        producer.publish_event(&info(), 1, true).await;
+        producer.publish_event(&chunk(), 1, true).await;
+        producer.publish_event(&usage(), 1, true).await;
+        assert_eq!(kinds(&mut rx), ["agent_message_chunk"]);
+        producer.flush_deferred(true).await;
+        assert!(kinds(&mut rx).is_empty());
+        producer.flush_deferred(false).await;
+        assert_eq!(kinds(&mut rx), ["session_info_update", "usage_update"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_is_not_held_when_not_streaming() {
+        let (producer, mut rx) = open_producer().await;
+        producer.publish_event(&usage(), 1, false).await;
+        assert_eq!(kinds(&mut rx), ["usage_update"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_telemetry_is_released_after_silence_not_total_hold_time() {
+        let (producer, mut rx) = open_producer().await;
+        producer.publish_event(&usage(), 1, true).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        producer.publish_event(&chunk(), 1, true).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(kinds(&mut rx), ["agent_message_chunk"]);
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        assert_eq!(kinds(&mut rx), ["usage_update"]);
     }
 }
