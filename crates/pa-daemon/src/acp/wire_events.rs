@@ -7,11 +7,14 @@
 //! `agent_begin/end`, `session_action_update`) map to nothing, exactly like
 //! the TS switch's default arm.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
+
 use serde::Deserialize as _;
 use serde_json::{json, Value};
 
 use super::meta::{prime_agent_meta, PrimeAgentCompactionMeta, PrimeAgentSessionMeta};
-use super::types::{AcpSessionUpdate, AcpToolKind, AcpToolStatus, TextBlock};
+use super::types::{AcpSessionUpdate, AcpToolKind, AcpToolStatus, TextBlock, ToolCallContent};
 
 /// The model-facing Python REPL tool.
 const IPYTHON_TOOL_NAME: &str = "ipython";
@@ -24,6 +27,9 @@ pub struct WireMappingState {
     next_assistant_message_sequence: u64,
     active_assistant_message_id: Option<String>,
     active_bash_run_id: Option<String>,
+    ipython_cells: HashMap<String, String>,
+    ipython_output: HashMap<String, String>,
+    last_child_info: HashMap<String, String>,
 }
 
 impl WireMappingState {
@@ -109,7 +115,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 .and_then(Value::as_str)
             {
                 Some("thinking_delta") => vec![AcpSessionUpdate::AgentThoughtChunk {
-                    message_id,
+                    message_id: format!("{message_id}-thought"),
                     content: TextBlock::new(delta),
                 }],
                 Some("text_delta") => vec![AcpSessionUpdate::AgentMessageChunk {
@@ -147,21 +153,67 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
             } else {
                 None
             };
-            let title = if tool_name == IPYTHON_TOOL_NAME {
-                "Python cell".to_string()
-            } else {
-                tool_name.clone()
+            let title = match &cell {
+                Some(code) => ipython_cell_title(code),
+                None => tool_name.clone(),
             };
+            let content = cell
+                .as_ref()
+                .map(|code| ipython_call_content(Some(code), None));
+            if let Some(code) = &cell {
+                state
+                    .ipython_cells
+                    .insert(tool_call_id.clone(), code.clone());
+            }
             vec![AcpSessionUpdate::ToolCall {
                 tool_call_id,
                 title,
                 kind: AcpToolKind::of_tool(&tool_name),
                 status: AcpToolStatus::InProgress,
+                content,
                 raw_input: match cell {
                     Some(code) => json!({ "code": code }),
                     None => args,
                 },
             }]
+        }
+        "tool_execution_update" => {
+            let tool_call_id = event
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some(cell) = state.ipython_cells.get(tool_call_id) else {
+                return Vec::new();
+            };
+            let is_starting = event
+                .get("partialResult")
+                .and_then(|result| result.get("details"))
+                .and_then(|details| details.get("status"))
+                .and_then(Value::as_str)
+                == Some("starting");
+            let Some(chunk) = tool_result_text(event.get("partialResult")).filter(|_| !is_starting)
+            else {
+                return Vec::new();
+            };
+            let content = {
+                let output = state
+                    .ipython_output
+                    .entry(tool_call_id.to_string())
+                    .or_default();
+                output.push_str(&chunk);
+                ipython_call_content(Some(cell), Some(output))
+            };
+            vec![AcpSessionUpdate::ToolCallUpdate {
+                tool_call_id: tool_call_id.to_string(),
+                status: Some(AcpToolStatus::InProgress),
+                content: Some(content),
+                meta: None,
+            }]
+        }
+        "agent_end" => {
+            state.ipython_cells.clear();
+            state.ipython_output.clear();
+            Vec::new()
         }
         "tool_execution_end" => {
             let tool_call_id = event
@@ -175,6 +227,11 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 .unwrap_or(false);
             let text = tool_result_text(event.get("result"));
             let rich = ipython_rich_output(event.get("result"));
+            state.ipython_output.remove(&tool_call_id);
+            let content = match state.ipython_cells.remove(&tool_call_id) {
+                Some(cell) => Some(ipython_call_content(Some(&cell), text.as_deref())),
+                None => text.map(|text| vec![ToolCallContent::new(text)]),
+            };
             let update = AcpSessionUpdate::ToolCallUpdate {
                 tool_call_id,
                 status: Some(if is_error {
@@ -182,7 +239,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 } else {
                     AcpToolStatus::Completed
                 }),
-                content: text.map(|text| vec![super::types::ToolCallContent::new(text)]),
+                content,
                 meta: rich.map(|rich| {
                     prime_agent_meta(&PrimeAgentSessionMeta {
                         ipython: Some(rich),
@@ -210,6 +267,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 title: command.clone(),
                 kind: AcpToolKind::Execute,
                 status: AcpToolStatus::InProgress,
+                content: None,
                 raw_input: json!({ "command": command }),
             }]
         }
@@ -294,6 +352,25 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
         }
         "rlm_child_update" => {
             let child = event.get("child");
+            let field = |name: &str| child.and_then(|child| child.get(name)).cloned();
+            let key = json!([
+                field("id"),
+                field("sessionName"),
+                field("status"),
+                field("model"),
+                field("tokenCount"),
+                field("error")
+            ])
+            .to_string();
+            let id = child
+                .and_then(|child| child.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if state.last_child_info.get(&id) == Some(&key) {
+                return Vec::new();
+            }
+            state.last_child_info.insert(id, key);
             vec![AcpSessionUpdate::SessionInfoUpdate {
                 meta: prime_agent_meta(&PrimeAgentSessionMeta {
                     subagents: Some(vec![super::meta::PrimeAgentSubagentMeta {
@@ -406,6 +483,57 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
         }
         _ => Vec::new(),
     }
+}
+
+const TITLE_MAX_LENGTH: usize = 120;
+
+fn ipython_cell_title(code: &str) -> String {
+    let cleaned: String = code
+        .chars()
+        .filter(|c| {
+            !matches!(c,
+                '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'..='\u{9f}'
+                | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect();
+    let mut lines = cleaned.split('\n').filter(|line| !line.trim().is_empty());
+    let first = lines.next().map_or("", str::trim);
+    let extra = lines.count();
+    let mut title = if first.is_empty() {
+        "Python cell".to_string()
+    } else if first.chars().count() > TITLE_MAX_LENGTH {
+        let mut head: String = first.chars().take(TITLE_MAX_LENGTH - 1).collect();
+        head.push('\u{2026}');
+        head
+    } else {
+        first.to_string()
+    };
+    if extra > 0 {
+        let _ = write!(title, " \u{b7} +{extra} lines");
+    }
+    title
+}
+
+/// The fence outgrows any backtick run inside the text, so an untrusted
+/// cell cannot close its own block.
+fn fenced_content(text: &str, language: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}{language}\n{text}\n{fence}")
+}
+
+/// Clients replace content on update, so every update repeats the cell.
+fn ipython_call_content(cell: Option<&str>, output: Option<&str>) -> Vec<ToolCallContent> {
+    let cell = cell.map(|cell| ToolCallContent::new(fenced_content(cell, "python")));
+    let output = output
+        .filter(|output| !output.is_empty())
+        .map(|output| ToolCallContent::new(fenced_content(output, "text")));
+    cell.into_iter().chain(output).collect()
 }
 
 /// The synthetic tool-call id of a user-level bash run:
@@ -607,7 +735,8 @@ mod tests {
         );
         let value = serde_json::to_value(&updates[0]).unwrap();
         assert_eq!(value["sessionUpdate"], "tool_call");
-        assert_eq!(value["title"], "Python cell");
+        assert_eq!(value["title"], "print(1)");
+        assert_eq!(value["kind"], "other");
         assert_eq!(value["rawInput"], json!({ "code": "print(1)" }));
         let updates = wire_updates(
             &json!({
@@ -621,7 +750,11 @@ mod tests {
         let value = serde_json::to_value(&updates[0]).unwrap();
         assert_eq!(value["sessionUpdate"], "tool_call_update");
         assert_eq!(value["status"], "completed");
-        assert_eq!(value["content"][0]["content"]["text"], "1\n");
+        assert_eq!(
+            value["content"][0]["content"]["text"],
+            "```python\nprint(1)\n```"
+        );
+        assert_eq!(value["content"][1]["content"]["text"], "```text\n1\n\n```");
     }
 
     #[test]
@@ -854,5 +987,216 @@ mod tests {
                 "deliveryStatus": "queued",
             })
         );
+    }
+
+    fn ipython_start(id: &str, code: &str) -> Value {
+        json!({
+            "type": "tool_execution_start",
+            "toolCallId": id,
+            "toolName": "ipython",
+            "args": { "code": code },
+        })
+    }
+
+    fn content_texts(update: &AcpSessionUpdate) -> Vec<String> {
+        update.to_bare_value()["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .map(|block| block["content"]["text"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn ipython_call_is_titled_by_its_cell() {
+        let mut state = WireMappingState::default();
+        let title = |code: &str, state: &mut WireMappingState| {
+            wire_updates(&ipython_start("c", code), state)[0].to_bare_value()["title"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(title("\n  x = 1  \n", &mut state), "x = 1");
+        assert_eq!(title("a\n\n b\n", &mut state), "a \u{b7} +1 lines");
+        assert_eq!(title("a\nb\nc", &mut state), "a \u{b7} +2 lines");
+        assert_eq!(title("\n \n", &mut state), "Python cell");
+        assert_eq!(title("pr\u{202e}int\u{0}(\u{7f}1)", &mut state), "print(1)");
+        let long = "x".repeat(200);
+        let capped = title(&long, &mut state);
+        assert_eq!(capped.chars().count(), 120);
+        assert!(capped.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn ipython_call_carries_the_fenced_cell_and_keeps_other_tools_plain() {
+        let mut state = WireMappingState::default();
+        let updates = wire_updates(&ipython_start("c", "s = '```'"), &mut state);
+        let value = updates[0].to_bare_value();
+        assert_eq!(value["kind"], "other");
+        assert_eq!(value["rawInput"], json!({ "code": "s = '```'" }));
+        assert_eq!(
+            content_texts(&updates[0]),
+            vec!["````python\ns = '```'\n````".to_string()]
+        );
+        let updates = wire_updates(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "b",
+                "toolName": "bash",
+                "args": { "command": "ls" },
+            }),
+            &mut state,
+        );
+        let value = updates[0].to_bare_value();
+        assert_eq!(value["kind"], "execute");
+        assert_eq!(value["title"], "bash");
+        assert!(value.get("content").is_none());
+        let updates = wire_updates(
+            &json!({
+                "type": "tool_execution_end",
+                "toolCallId": "b",
+                "result": { "output": "x" },
+                "isError": false,
+            }),
+            &mut state,
+        );
+        assert_eq!(content_texts(&updates[0]), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn ipython_end_repeats_the_cell_and_omits_empty_output() {
+        let mut state = WireMappingState::default();
+        wire_updates(&ipython_start("c", "pass"), &mut state);
+        let updates = wire_updates(
+            &json!({
+                "type": "tool_execution_end",
+                "toolCallId": "c",
+                "result": { "output": "" },
+                "isError": true,
+            }),
+            &mut state,
+        );
+        assert_eq!(updates[0].to_bare_value()["status"], "failed");
+        assert_eq!(
+            content_texts(&updates[0]),
+            vec!["```python\npass\n```".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_end_releases_a_cell_whose_call_never_ended() {
+        let mut state = WireMappingState::default();
+        wire_updates(&ipython_start("c", "pass"), &mut state);
+        wire_updates(
+            &json!({
+                "type": "tool_execution_update",
+                "toolCallId": "c",
+                "partialResult": { "content": [{ "type": "text", "text": "a" }] },
+            }),
+            &mut state,
+        );
+        assert!(wire_updates(&json!({ "type": "agent_end" }), &mut state).is_empty());
+        let updates = wire_updates(
+            &json!({
+                "type": "tool_execution_end",
+                "toolCallId": "c",
+                "result": { "output": "late" },
+                "isError": false,
+            }),
+            &mut state,
+        );
+        assert_eq!(content_texts(&updates[0]), vec!["late".to_string()]);
+    }
+
+    #[test]
+    fn ipython_updates_republish_the_cell_with_all_output_so_far() {
+        let mut state = WireMappingState::default();
+        wire_updates(&ipython_start("c", "print(1)"), &mut state);
+        let chunk = |text: &str| {
+            json!({
+                "type": "tool_execution_update",
+                "toolCallId": "c",
+                "partialResult": { "content": [{ "type": "text", "text": text }] },
+            })
+        };
+        let first = wire_updates(&chunk("one\n"), &mut state);
+        let value = first[0].to_bare_value();
+        assert_eq!(value["sessionUpdate"], "tool_call_update");
+        assert_eq!(value["status"], "in_progress");
+        assert_eq!(
+            content_texts(&first[0]),
+            vec![
+                "```python\nprint(1)\n```".to_string(),
+                "```text\none\n\n```".to_string()
+            ]
+        );
+        let second = wire_updates(&chunk("two\n"), &mut state);
+        assert_eq!(
+            content_texts(&second[0])[1],
+            "```text\none\ntwo\n\n```".to_string()
+        );
+        assert!(wire_updates(&chunk(""), &mut state).is_empty());
+        let end = wire_updates(
+            &json!({
+                "type": "tool_execution_end",
+                "toolCallId": "c",
+                "result": { "output": "final" },
+                "isError": false,
+            }),
+            &mut state,
+        );
+        assert_eq!(content_texts(&end[0])[1], "```text\nfinal\n```".to_string());
+    }
+
+    #[test]
+    fn update_for_an_untracked_call_maps_to_nothing() {
+        let mut state = WireMappingState::default();
+        let updates = wire_updates(
+            &json!({
+                "type": "tool_execution_update",
+                "toolCallId": "b",
+                "toolName": "bash",
+                "partialResult": { "content": [{ "type": "text", "text": "x" }] },
+            }),
+            &mut state,
+        );
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn thought_chunks_use_their_own_message_id() {
+        let mut state = WireMappingState::default();
+        wire_updates(
+            &json!({ "type": "message_start", "message": { "role": "assistant" } }),
+            &mut state,
+        );
+        let delta = |kind: &str| {
+            json!({
+                "type": "message_update",
+                "message": { "role": "assistant" },
+                "assistantMessageEvent": { "type": kind, "delta": "x" },
+            })
+        };
+        let thought = wire_updates(&delta("thinking_delta"), &mut state)[0].to_bare_value();
+        let text = wire_updates(&delta("text_delta"), &mut state)[0].to_bare_value();
+        assert_eq!(thought["messageId"], "prime-agent-assistant-1-thought");
+        assert_eq!(text["messageId"], "prime-agent-assistant-1");
+    }
+
+    #[test]
+    fn rlm_child_update_publishes_only_when_the_record_changes() {
+        let mut state = WireMappingState::default();
+        let event = |status: &str, label: &str| {
+            json!({
+                "type": "rlm_child_update",
+                "child": { "id": "c1", "status": status, "label": label },
+            })
+        };
+        assert_eq!(wire_updates(&event("running", "a"), &mut state).len(), 1);
+        assert!(wire_updates(&event("running", "b"), &mut state).is_empty());
+        assert_eq!(wire_updates(&event("done", "b"), &mut state).len(), 1);
     }
 }

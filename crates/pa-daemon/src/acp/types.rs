@@ -81,11 +81,11 @@ pub enum AcpToolKind {
 }
 
 impl AcpToolKind {
-    /// The kind map: the model-facing tool is the Python REPL; bash is the
-    /// secondary escape hatch.
+    /// The kind map: `execute` makes `JetBrains` open a terminal block whose
+    /// details are nulled on completion, so the Python REPL stays `other`.
     pub fn of_tool(tool_name: &str) -> AcpToolKind {
         match tool_name {
-            "ipython" | "bash" => AcpToolKind::Execute,
+            "bash" => AcpToolKind::Execute,
             "read" => AcpToolKind::Read,
             "edit" | "write" => AcpToolKind::Edit,
             _ => AcpToolKind::Other,
@@ -154,6 +154,8 @@ pub enum AcpSessionUpdate {
         title: String,
         kind: AcpToolKind,
         status: AcpToolStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ToolCallContent>>,
         #[serde(rename = "rawInput")]
         raw_input: Value,
     },
@@ -432,7 +434,7 @@ mod tests {
 
     #[test]
     fn tool_kind_map_matches_the_ts_map() {
-        assert_eq!(AcpToolKind::of_tool("ipython"), AcpToolKind::Execute);
+        assert_eq!(AcpToolKind::of_tool("ipython"), AcpToolKind::Other);
         assert_eq!(AcpToolKind::of_tool("bash"), AcpToolKind::Execute);
         assert_eq!(AcpToolKind::of_tool("read"), AcpToolKind::Read);
         assert_eq!(AcpToolKind::of_tool("edit"), AcpToolKind::Edit);
@@ -511,6 +513,7 @@ mod tests {
             title: "Python cell".into(),
             kind: AcpToolKind::Execute,
             status: AcpToolStatus::InProgress,
+            content: None,
             raw_input: json!({ "code": "1+1" }),
         };
         let value = call.to_bare_value();
