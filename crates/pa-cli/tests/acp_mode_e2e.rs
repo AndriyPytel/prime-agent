@@ -2304,6 +2304,22 @@ fn spawn_lane(
     (client, session_id, active_session_id)
 }
 
+/// A fire-and-forget child that never idles must not hang `session/prompt`:
+/// the completion wait and the settle are bounded (TS f830294bf).
+#[test]
+fn acp_prompt_responds_while_a_fire_and_forget_child_never_idles() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 600_000, &kernel_python);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let (prompt_response, _) = client.wait_response(prompt, Duration::from_secs(20));
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+}
+
 /// The ACP settle waits for RLM quiescence (TS #1612): the completion
 /// update reports the live outstanding-subagent count, the terminal update
 /// reports zero, and the settled child's terminal-notice turn ("notice
@@ -2313,7 +2329,7 @@ fn acp_prompt_settles_after_rlm_quiescence() {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
-    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 5_000, &kernel_python);
+    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 1_500, &kernel_python);
     let prompt = client.request(
         "session/prompt",
         &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
