@@ -308,7 +308,7 @@ mod tests {
         producer.publish_event(&usage(), 1, true).await;
         assert_eq!(kinds(&mut rx), ["agent_message_chunk"]);
         producer.flush_deferred(true).await;
-        assert!(kinds(&mut rx).is_empty());
+        assert_eq!(kinds(&mut rx).len(), 0);
         producer.flush_deferred(false).await;
         assert_eq!(kinds(&mut rx), ["session_info_update", "usage_update"]);
     }

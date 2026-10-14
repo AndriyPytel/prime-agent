@@ -1675,7 +1675,7 @@ async fn prompt_turn(
                 hosted.pending_terminal = None;
             }
             match joined {
-                Ok(SettleOutcome::Settled(status)) => Some(status),
+                Ok(SettleOutcome::Settled(status)) => Some(*status),
                 Ok(SettleOutcome::Failed(message)) => {
                     return super::internal_error(&id, &message);
                 }
@@ -1715,7 +1715,7 @@ async fn prompt_turn(
 const PROMPT_SETTLE_GRACE: Duration = Duration::from_secs(3);
 
 enum SettleOutcome {
-    Settled(pa_core::autonomous::AgentAutonomousStatus),
+    Settled(Box<pa_core::autonomous::AgentAutonomousStatus>),
     Cancelled,
     Failed(String),
 }
@@ -1780,7 +1780,7 @@ async fn settle_terminal(
         if !boundary_published || !terminal_published {
             return SettleOutcome::Failed("Failed to publish ACP completion".to_string());
         }
-        return SettleOutcome::Settled(status);
+        return SettleOutcome::Settled(Box::new(status));
     }
 }
 
