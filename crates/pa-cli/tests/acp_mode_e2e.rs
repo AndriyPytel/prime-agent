@@ -2907,6 +2907,17 @@ fn acp_air_load_announces_the_known_children_before_the_response() {
         .position(|k| *k == "subagent_state_update")
         .expect("state");
     assert!(spawned < state, "{kinds:?}");
+    let child_id = updates
+        .iter()
+        .find(|f| f["params"]["update"]["sessionUpdate"] == "subagent_spawned")
+        .map(|f| f["params"]["update"]["subagentSessionId"].clone())
+        .expect("child id");
+    assert!(
+        updates
+            .iter()
+            .any(|f| f["params"]["sessionId"] == child_id && f.to_string().contains("kid done")),
+        "{updates:?}"
+    );
 }
 
 fn fork_params(first: &AcpChild, session_id: &str, meta: &Value) -> Value {

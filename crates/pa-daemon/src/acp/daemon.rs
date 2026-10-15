@@ -1784,6 +1784,12 @@ async fn handle_session_new(
                     "disconnected"
                 },
             );
+            if state != "running" {
+                replay_child_history(
+                    &UpdateProducer::new(child_acp_id(child), tx.clone()),
+                    child,
+                );
+            }
             producer.replay(&types::AcpSessionUpdate::SubagentStateUpdate {
                 subagent_session_id: child_acp_id(child),
                 state: state.to_string(),
@@ -2779,6 +2785,16 @@ fn subagent_spawned(child: &Value) -> types::AcpSessionUpdate {
     }
 }
 
+/// Replay a child's stored transcript under its acp id.
+fn replay_child_history(producer: &UpdateProducer, child: &Value) {
+    let Some(path) = child.get("sessionFile").and_then(Value::as_str) else {
+        return;
+    };
+    for update in wire_events::replay_updates(&stored_messages(Path::new(path))) {
+        producer.replay(&update);
+    }
+}
+
 /// Mirror one rlm child's daemon session as its own ACP session: attach
 /// only, so the child's events stream out under its acp id.
 async fn open_watch_host(ctx: &WatchCtx, parent_id: &str, child: &Value) -> anyhow::Result<()> {
@@ -2790,11 +2806,10 @@ async fn open_watch_host(ctx: &WatchCtx, parent_id: &str, child: &Value) -> anyh
         .to_string();
     let link = Arc::new(DaemonLink::connect(&ctx.socket_path).await?);
     let producer = UpdateProducer::new(acp_id.clone(), ctx.tx.clone());
-    producer.commit_session_new_response().await;
     let hosted = HostedSession {
         acp_session_id: acp_id.clone(),
         daemon_active_session_id: active.clone(),
-        producer,
+        producer: Arc::clone(&producer),
         config: Arc::new(HostedConfig {
             queue: tokio::sync::Mutex::new(()),
             published: tokio::sync::Mutex::new(Vec::new()),
@@ -2840,6 +2855,9 @@ async fn open_watch_host(ctx: &WatchCtx, parent_id: &str, child: &Value) -> anyh
         consumer.abort();
         anyhow::bail!("watch attach failed");
     }
+    // Live events stay held until the history is replayed ahead of them.
+    replay_child_history(&producer, child);
+    producer.commit_session_new_response().await;
     ctx.hosts.lock().unwrap().insert(
         acp_id,
         SessionHost {

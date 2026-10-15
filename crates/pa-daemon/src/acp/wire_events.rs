@@ -104,8 +104,12 @@ pub fn replay_updates(messages: &[(String, Value)]) -> Vec<AcpSessionUpdate> {
                 }
             }
             Some("assistant") => {
-                let blocks = message.get("content").and_then(Value::as_array);
-                for block in blocks.into_iter().flatten() {
+                let blocks = match message.get("content") {
+                    Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+                    Some(Value::Array(blocks)) => blocks.clone(),
+                    _ => Vec::new(),
+                };
+                for block in &blocks {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => {
                             let text = block

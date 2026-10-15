@@ -205,6 +205,9 @@ impl ChildRecord {
         if let Some(error) = &self.error {
             snapshot["error"] = json!(error);
         }
+        if let Some(file) = &self.session_file {
+            snapshot["sessionFile"] = json!(file);
+        }
         snapshot
     }
 
