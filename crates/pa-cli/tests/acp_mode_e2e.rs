@@ -2701,3 +2701,34 @@ fn acp_session_resume_reopens_a_saved_session_without_replay() {
     let saved = std::fs::read_to_string(&file).unwrap();
     assert!(saved.contains("Name a river.") && saved.contains("Name a mountain."));
 }
+
+#[test]
+fn acp_session_load_replays_history_before_the_response() {
+    let (first, session_id, file) = saved_session_with_one_turn();
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let load = second.request(
+        "session/load",
+        &json!({ "sessionId": session_id, "cwd": session_cwd(&first), "mcpServers": [] }),
+    );
+    let (response, updates) = second.wait_response(load, TIMEOUT);
+    assert!(response["result"]["configOptions"].is_array(), "{response}");
+    assert_eq!(
+        replayed(&updates),
+        vec!["user_message_chunk", "agent_message_chunk"]
+    );
+    let user = &updates[0]["params"]["update"];
+    assert_eq!(user["content"]["text"], "Name a river.");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    let user_entry_id = saved
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| entry["message"]["role"] == "user")
+        .map(|entry| entry["id"].clone())
+        .expect("a stored user entry");
+    assert_eq!(user["messageId"], user_entry_id);
+    assert_prompt_ends_turn(&mut second, &session_id, "Name a mountain.");
+    let appended = std::fs::read_to_string(&file).unwrap();
+    assert!(appended.contains("Name a river.") && appended.contains("Name a mountain."));
+}

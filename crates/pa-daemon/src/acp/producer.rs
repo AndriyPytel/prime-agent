@@ -106,6 +106,15 @@ impl UpdateProducer {
         }
     }
 
+    /// Send a replayed history update at once, ahead of the held updates,
+    /// so it precedes the `session/load` response.
+    pub fn replay(&self, update: &AcpSessionUpdate) {
+        self.send(jsonrpc::notification(
+            "session/update",
+            &json!({ "sessionId": self.session_id, "update": update.to_bare_value() }),
+        ));
+    }
+
     /// Fence the producer: no further updates are admitted, matching a
     /// closed session until a replacement `session/new` is admitted.
     pub async fn close(&self) {

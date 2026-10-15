@@ -1218,7 +1218,7 @@ async fn open_new_session(
         .durable_session_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    host_session(id, &params, &acp_session_id, host, hosts, tx.clone()).await;
+    host_session(id, &params, &acp_session_id, host, &[], hosts, tx.clone()).await;
 }
 
 /// `session/resume`, `session/load` and `session/fork`: host a saved
@@ -1266,6 +1266,7 @@ async fn open_existing_session(
         .map(|header| PathBuf::from(header.cwd))
         .filter(|cwd| !cwd.as_os_str().is_empty() && cwd.exists())
         .unwrap_or(requested_cwd);
+    let path_for_history = path.clone();
     let create = (options.fresh_create)(&cwd, Some(path));
     let host = match open_host(&options.socket_path, cwd, create).await {
         Ok(host) => host,
@@ -1274,7 +1275,26 @@ async fn open_existing_session(
             return;
         }
     };
-    host_session(id, &params, &session_id, host, hosts, tx.clone()).await;
+    let history = if method == "session/load" {
+        stored_messages(&path_for_history)
+    } else {
+        Vec::new()
+    };
+    host_session(id, &params, &session_id, host, &history, hosts, tx.clone()).await;
+}
+
+/// The stored message rows of the session file's current branch, with
+/// their entry ids.
+fn stored_messages(path: &Path) -> Vec<(String, Value)> {
+    let Ok(store) = crate::session_store::SessionFile::open(path) else {
+        return Vec::new();
+    };
+    store
+        .branch()
+        .into_iter()
+        .filter(|entry| entry.type_ == "message")
+        .filter_map(|entry| Some((entry.id.clone(), entry.fields.get("message")?.clone())))
+        .collect()
 }
 
 /// Register the host, run the admission, and drop the host again when
@@ -1284,6 +1304,7 @@ async fn host_session(
     params: &Value,
     acp_session_id: &str,
     host: SessionHost,
+    history: &[(String, Value)],
     hosts: &Hosts,
     tx: producer::FrameSink,
 ) {
@@ -1291,7 +1312,7 @@ async fn host_session(
         .lock()
         .unwrap()
         .insert(acp_session_id.to_string(), host.clone());
-    handle_session_new(id, params.clone(), acp_session_id, &host, tx).await;
+    handle_session_new(id, params.clone(), acp_session_id, &host, history, tx).await;
     if host.state.lock().await.session.is_none() {
         hosts.lock().unwrap().remove(acp_session_id);
         teardown(&host.link, &host.state, &host.binding).await;
@@ -1342,6 +1363,7 @@ async fn handle_session_new(
     params: Value,
     acp_session_id: &str,
     host: &SessionHost,
+    history: &[(String, Value)],
     tx: producer::FrameSink,
 ) {
     let SessionHost {
@@ -1522,6 +1544,9 @@ async fn handle_session_new(
                 }
             }
         }
+    }
+    for update in wire_events::replay_updates(history) {
+        producer.replay(&update);
     }
     let _ = tx.send(jsonrpc::response(&id, &result));
     {
@@ -2621,13 +2646,22 @@ mod tests {
             json!({ "mcpServers": [{ "name": "example", "command": "echo", "args": [], "env": [] }] }),
             "acp-1",
             &host,
+            &[],
             tx.clone(),
         )
         .await;
         assert!(responses.recv().await.unwrap().get("error").is_some());
         assert_eq!(state.lock().await.mcp_server_names, vec!["example"]);
 
-        handle_session_new(json!(2), json!({ "mcpServers": [] }), "acp-1", &host, tx).await;
+        handle_session_new(
+            json!(2),
+            json!({ "mcpServers": [] }),
+            "acp-1",
+            &host,
+            &[],
+            tx,
+        )
+        .await;
         assert!(responses.recv().await.unwrap().get("result").is_some());
         assert!(state.lock().await.mcp_server_names.is_empty());
         drop(host);

@@ -132,6 +132,13 @@ pub struct AcpStopReasonResponse {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "sessionUpdate")]
 pub enum AcpSessionUpdate {
+    /// A stored user message replayed by `session/load`.
+    #[serde(rename = "user_message_chunk")]
+    UserMessageChunk {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        content: Value,
+    },
     /// A streaming chunk of the assistant's visible answer.
     #[serde(rename = "agent_message_chunk")]
     AgentMessageChunk {

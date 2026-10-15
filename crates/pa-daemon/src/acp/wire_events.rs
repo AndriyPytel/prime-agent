@@ -75,6 +75,98 @@ pub fn assistant_stop(event: &Value) -> Option<AssistantStop> {
     })
 }
 
+/// The ACP updates that replay stored `(entry id, message)` rows for
+/// `session/load`: user and assistant text and thinking as chunks, tool
+/// calls as completed calls carrying their stored result.
+pub fn replay_updates(messages: &[(String, Value)]) -> Vec<AcpSessionUpdate> {
+    let mut state = WireMappingState::default();
+    let mut updates = Vec::new();
+    for (entry_id, message) in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                let blocks = match message.get("content") {
+                    Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+                    Some(Value::Array(blocks)) => blocks.clone(),
+                    _ => Vec::new(),
+                };
+                for block in blocks {
+                    let empty_text = block.get("type").and_then(Value::as_str) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_none_or(str::is_empty);
+                    if !empty_text {
+                        updates.push(AcpSessionUpdate::UserMessageChunk {
+                            message_id: entry_id.clone(),
+                            content: block,
+                        });
+                    }
+                }
+            }
+            Some("assistant") => {
+                let blocks = message.get("content").and_then(Value::as_array);
+                for block in blocks.into_iter().flatten() {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            let text = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if !text.is_empty() {
+                                updates.push(AcpSessionUpdate::AgentMessageChunk {
+                                    message_id: entry_id.clone(),
+                                    content: TextBlock::new(text),
+                                });
+                            }
+                        }
+                        Some("thinking") => {
+                            let text = block
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if !text.is_empty() {
+                                updates.push(AcpSessionUpdate::AgentThoughtChunk {
+                                    message_id: format!("{entry_id}-thought"),
+                                    content: TextBlock::new(text),
+                                });
+                            }
+                        }
+                        Some("toolCall") => {
+                            let start = json!({
+                                "type": "tool_execution_start",
+                                "toolCallId": block.get("id"),
+                                "toolName": block.get("name"),
+                                "args": block.get("arguments"),
+                            });
+                            for mut update in wire_updates(&start, &mut state) {
+                                if let AcpSessionUpdate::ToolCall { status, .. } = &mut update {
+                                    *status = AcpToolStatus::Completed;
+                                }
+                                updates.push(update);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("toolResult") => {
+                let end = json!({
+                    "type": "tool_execution_end",
+                    "toolCallId": message.get("toolCallId"),
+                    "isError": message.get("isError"),
+                    "result": {
+                        "content": message.get("content"),
+                        "details": message.get("details"),
+                    },
+                });
+                updates.extend(wire_updates(&end, &mut state));
+            }
+            _ => {}
+        }
+    }
+    updates
+}
+
 /// Map one daemon session event to zero or more ACP updates.
 pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessionUpdate> {
     let event_type = event
@@ -639,6 +731,38 @@ fn ipython_rich_output(result: Option<&Value>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_maps_stored_rows_to_chunks_and_completed_tool_calls() {
+        let rows = vec![
+            ("u1".to_string(), json!({ "role": "user", "content": "hi" })),
+            (
+                "a1".to_string(),
+                json!({ "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": "hm" },
+                    { "type": "toolCall", "id": "c1", "name": "ipython", "arguments": { "code": "1+1" } },
+                ] }),
+            ),
+            (
+                "r1".to_string(),
+                json!({ "role": "toolResult", "toolCallId": "c1", "content": [{ "type": "text", "text": "2" }] }),
+            ),
+        ];
+        let kinds: Vec<Value> = replay_updates(&rows)
+            .iter()
+            .map(|update| update.to_bare_value())
+            .map(|value| json!([value["sessionUpdate"], value["messageId"], value["status"]]))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!(["user_message_chunk", "u1", null]),
+                json!(["agent_thought_chunk", "a1-thought", null]),
+                json!(["tool_call", null, "completed"]),
+                json!(["tool_call_update", null, "completed"]),
+            ]
+        );
+    }
 
     #[test]
     fn streaming_spans_the_first_chunk_to_the_assistant_message_end() {
