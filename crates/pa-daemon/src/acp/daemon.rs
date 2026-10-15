@@ -247,9 +247,9 @@ pub type ResolveSession = Arc<dyn Fn(&str, &Path) -> Result<PathBuf, String> + S
 pub struct DaemonAcpOptions {
     pub socket_path: PathBuf,
     pub product_version: String,
-    /// The `create` built from the CLI session flags; the first
-    /// `session/new` runs it in `first_cwd`.
-    pub first_create: DaemonCommand,
+    /// The cwd and `create` of the session the CLI flags select, run by the
+    /// first `session/new`; `None` when they select none.
+    pub first_create: Option<(PathBuf, DaemonCommand)>,
     pub first_cwd: PathBuf,
     /// Builds the `create` of every later session for a cwd and an
     /// optional existing session file.
@@ -377,7 +377,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
     let probe = DaemonLink::connect(&options.socket_path).await?;
     drop(probe);
     let hosts: Hosts = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let mut first = Some((options.first_cwd.clone(), options.first_create.clone()));
+    let mut first = options.first_create.clone();
 
     // Only the prompt handlers stay owned: EOF aborts them (TS aborts the
     // controller and exits), so the process never waits on a prompt still

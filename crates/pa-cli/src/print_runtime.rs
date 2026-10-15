@@ -103,14 +103,14 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     crate::interactive_mode::ensure_daemon_running(&socket_path, &options.config.cwd)
         .await
         .map_err(|error| format!("{error:#}"))?;
-    let (first_cwd, first_create) = daemon_acp_create(options)?;
+    let first_create = daemon_acp_create(options)?;
     let session_dir = replacement_session_dir(options);
     let fresh_options = options.clone();
     let resolve_dir = session_dir.clone();
     pa_daemon::acp::daemon::run_daemon_attached_acp_mode(pa_daemon::acp::daemon::DaemonAcpOptions {
         socket_path,
         product_version: crate::config::version().to_string(),
-        first_cwd,
+        first_cwd: options.config.cwd.clone(),
         first_create,
         fresh_create: std::sync::Arc::new(move |cwd, session_path| {
             acp_create_command(
@@ -139,11 +139,12 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
 
 /// The ACP daemon session's create (TS main.ts `defaultSessionConfig` +
 /// the startup create): the session the flags select, client-owned only
-/// for `--no-session`, plus the session's cwd. The worker opens and
+/// for `--no-session`, plus the session's cwd; `None` when the flags
+/// select nothing, so the first `session/new` creates like every other. The worker opens and
 /// leases the selected file itself.
 fn daemon_acp_create(
     options: &RunOptions,
-) -> Result<(std::path::PathBuf, pa_types::daemon::DaemonCommand), String> {
+) -> Result<Option<(std::path::PathBuf, pa_types::daemon::DaemonCommand)>, String> {
     use pa_types::daemon::DaemonSessionLifecycle;
     let config = &options.config;
     let session_dir = replacement_session_dir(options);
@@ -170,12 +171,12 @@ fn daemon_acp_create(
                 stored_session_cwd(&path, &config.cwd, explicit_cwd_override(options))?,
                 Some(path),
             ),
-            HeadlessSession::Fresh => (config.cwd.clone(), None),
+            HeadlessSession::Fresh => return Ok(None),
         };
         (cwd, session_path, DaemonSessionLifecycle::Resident)
     };
     let create = acp_create_command(options, &cwd, session_path, lifecycle);
-    Ok((cwd, create))
+    Ok(Some((cwd, create)))
 }
 
 /// The ACP daemon session's `create` for one cwd and optional session

@@ -2803,3 +2803,29 @@ fn acp_session_fork_at_an_air_fork_point_keeps_that_turn_only() {
     assert!(forked.contains("Name a river.") && forked.contains("The Nile."));
     assert!(!forked.contains("Name a lake."), "{forked}");
 }
+
+#[test]
+fn acp_first_session_new_honors_params_cwd_when_the_flags_select_no_session() {
+    let mut client = AcpChild::spawn(
+        &["--mode", "acp"],
+        &json!({ "engine": "faux", "responses": ["The Nile."] }),
+    );
+    let init = client.request("initialize", &initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let work = tempfile::TempDir::new().unwrap();
+    let work_path = work.path().canonicalize().unwrap().display().to_string();
+    let new = client.request(
+        "session/new",
+        &json!({ "cwd": work_path, "mcpServers": [] }),
+    );
+    let (response, _) = client.wait_response(new, TIMEOUT);
+    assert!(response["result"].get("_meta").is_none(), "{response}");
+    let sessions = live_sessions(&client.socket);
+    assert_eq!(sessions[0]["cwd"], json!(work_path));
+    let file = sessions[0]["sessionFile"]
+        .as_str()
+        .expect("a saved session");
+    let header = pa_core::session::manager::read_session_header(std::path::Path::new(file))
+        .expect("a session header");
+    assert_eq!(header.cwd, work_path);
+}
