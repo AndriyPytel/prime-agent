@@ -4,7 +4,7 @@
 //! `session/read`, `session/clone`, cwd adoption) are not invented here.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// The `initialize` result payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +26,8 @@ pub struct AgentCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_capabilities: Option<McpCapabilities>,
     pub session_capabilities: SessionCapabilities,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,7 +399,21 @@ impl SetConfigOptionParams {
 }
 
 /// The initialize result with the served capability set.
-pub fn initialize_result(product_version: &str) -> InitializeResult {
+/// The `_meta` an Air client expects to see to show subagents natively.
+pub fn air_meta() -> Value {
+    json!({ "jetbrains": { "air": { "version": 1, "capabilities": ["nativeSubagentSessions"] } } })
+}
+
+/// Whether `initialize` params declare Air native subagent sessions.
+pub fn client_supports_native_subagents(params: &Value) -> bool {
+    let caps = &params["clientCapabilities"];
+    let air = &caps["_meta"]["jetbrains"]["air"]["capabilities"];
+    air.as_array()
+        .is_some_and(|list| list.iter().any(|c| c == "nativeSubagentSessions"))
+        || caps["subagents"].is_object()
+}
+
+pub fn initialize_result(product_version: &str, air: bool) -> InitializeResult {
     InitializeResult {
         protocol_version: 1,
         agent_capabilities: AgentCapabilities {
@@ -412,6 +428,7 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
                 resume: CloseCapability::default(),
                 fork: CloseCapability::default(),
             },
+            meta: air.then(air_meta),
         },
         agent_info: AgentInfo {
             name: "prime-agent".to_string(),
@@ -429,7 +446,7 @@ mod tests {
 
     #[test]
     fn initialize_result_matches_the_served_surface() {
-        let value = serde_json::to_value(initialize_result("9.9.9")).unwrap();
+        let value = serde_json::to_value(initialize_result("9.9.9", false)).unwrap();
         assert_eq!(
             value,
             json!({

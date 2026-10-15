@@ -323,6 +323,40 @@ fn acp_initialize_matches_the_ts_golden() {
     );
 }
 
+fn air_initialize_params() -> Value {
+    let mut params = initialize_params();
+    params["clientCapabilities"] = json!({
+        "_meta": { "jetbrains": { "air": { "version": 1, "capabilities": ["nativeSubagentSessions"] } } }
+    });
+    params
+}
+
+#[test]
+fn acp_air_client_gets_native_subagent_capability_and_others_do_not() {
+    let script = json!({ "responses": ["unused"] });
+    let mut air = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let id = air.request("initialize", &air_initialize_params());
+    let (response, _) = air.wait_response(id, TIMEOUT);
+    assert_eq!(
+        response["result"]["agentCapabilities"]["_meta"]["jetbrains"]["air"]["capabilities"],
+        json!(["nativeSubagentSessions"])
+    );
+    let new = air.request("session/new", &json!({ "mcpServers": [] }));
+    let (response, _) = air.wait_response(new, TIMEOUT);
+    assert_eq!(
+        response["result"]["_meta"]["jetbrains"]["air"]["version"], 1,
+        "{response}"
+    );
+
+    let mut plain = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let id = plain.request("initialize", &initialize_params());
+    let (response, _) = plain.wait_response(id, TIMEOUT);
+    assert!(!response.to_string().contains("jetbrains"), "{response}");
+    let new = plain.request("session/new", &json!({ "mcpServers": [] }));
+    let (response, _) = plain.wait_response(new, TIMEOUT);
+    assert!(!response.to_string().contains("jetbrains"), "{response}");
+}
+
 #[test]
 fn acp_second_initialize_is_served() {
     let script = json!({ "responses": ["unused"] });

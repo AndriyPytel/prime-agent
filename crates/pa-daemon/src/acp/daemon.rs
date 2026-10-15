@@ -339,6 +339,7 @@ pub(crate) struct DaemonAcpState {
     pub(crate) closed_input_pause_id: Option<String>,
     pub(crate) closed_input_pause_key: Option<String>,
     pub(crate) mcp_server_names: Vec<String>,
+    pub(crate) air: bool,
 }
 
 /// Serve the daemon-attached ACP mode until stdin closes. The caller
@@ -378,6 +379,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
     drop(probe);
     let hosts: Hosts = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let mut first = options.first_create.clone();
+    let air = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Only the prompt handlers stay owned: EOF aborts them (TS aborts the
     // controller and exits), so the process never waits on a prompt still
@@ -408,16 +410,23 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                 method.as_str()
             }
         };
+        if let ("initialize", Incoming::Request { params, .. }) = (method, &incoming) {
+            air.store(
+                types::client_supports_native_subagents(params),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let air_now = air.load(std::sync::atomic::Ordering::Relaxed);
         if method == "session/new" {
             if let Incoming::Request { id, params, .. } = incoming {
                 let cwd_pick = first.take();
-                open_new_session(id, params, cwd_pick, &options, &hosts, &tx).await;
+                open_new_session(id, params, cwd_pick, &options, &hosts, &tx, air_now).await;
             }
             continue;
         }
         if matches!(method, "session/resume" | "session/load" | "session/fork") {
             if let Incoming::Request { id, method, params } = incoming {
-                open_existing_session(id, &method, params, &options, &hosts, &tx).await;
+                open_existing_session(id, &method, params, &options, &hosts, &tx, air_now).await;
             }
             continue;
         }
@@ -430,8 +439,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         let Some(session_id) = session_id else {
             let options = options.clone();
             let options_tx = tx.clone();
+            let air = air.load(std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
-                handle_incoming(incoming, None, &options, options_tx).await;
+                handle_incoming(incoming, None, &options, options_tx, air).await;
             });
             continue;
         };
@@ -462,8 +472,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
             FrameOrder::Spawn => {
                 let options = options.clone();
                 let options_tx = tx.clone();
+                let air = air.load(std::sync::atomic::Ordering::Relaxed);
                 tokio::spawn(async move {
-                    handle_incoming(incoming, Some(&host), &options, options_tx).await;
+                    handle_incoming(incoming, Some(&host), &options, options_tx, air).await;
                 });
             }
             FrameOrder::AdmitPrompt {
@@ -1139,13 +1150,14 @@ async fn handle_incoming(
     host: Option<&SessionHost>,
     options: &DaemonAcpOptions,
     tx: producer::FrameSink,
+    air: bool,
 ) {
     let Incoming::Request { id, method, params } = incoming else {
         return;
     };
     match (method.as_str(), host) {
         ("initialize", _) => {
-            handle_initialize(&id, &params, &options.product_version, &tx);
+            handle_initialize(&id, &params, &options.product_version, &tx, air);
         }
         ("session/set_config_option", Some(host)) => {
             handle_set_config_option(id, params, &host.link, &host.state, tx).await;
@@ -1165,9 +1177,13 @@ async fn open_host(
     socket_path: &Path,
     cwd: PathBuf,
     create: DaemonCommand,
+    air: bool,
 ) -> anyhow::Result<SessionHost> {
     let link = Arc::new(DaemonLink::connect(socket_path).await?);
-    let state = Arc::new(Mutex::new(DaemonAcpState::default()));
+    let state = Arc::new(Mutex::new(DaemonAcpState {
+        air,
+        ..DaemonAcpState::default()
+    }));
     let consumer = spawn_event_consumer(Arc::clone(&link), Arc::clone(&state));
     match bind_daemon_session(&link, &state, create).await {
         Ok(binding) => Ok(SessionHost {
@@ -1193,6 +1209,7 @@ async fn open_new_session(
     options: &DaemonAcpOptions,
     hosts: &Hosts,
     tx: &producer::FrameSink,
+    air: bool,
 ) {
     let requested_cwd = params
         .get("cwd")
@@ -1208,7 +1225,7 @@ async fn open_new_session(
         let create = (options.fresh_create)(&cwd, None);
         (cwd, create)
     };
-    let host = match open_host(&options.socket_path, cwd, create).await {
+    let host = match open_host(&options.socket_path, cwd, create, air).await {
         Ok(host) => host,
         Err(error) => {
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
@@ -1232,6 +1249,7 @@ async fn open_existing_session(
     options: &DaemonAcpOptions,
     hosts: &Hosts,
     tx: &producer::FrameSink,
+    air: bool,
 ) {
     let session_id = params
         .get("sessionId")
@@ -1288,7 +1306,7 @@ async fn open_existing_session(
     };
     let path_for_history = path.clone();
     let create = (options.fresh_create)(&cwd, Some(path));
-    let host = match open_host(&options.socket_path, cwd, create).await {
+    let host = match open_host(&options.socket_path, cwd, create, air).await {
         Ok(host) => host,
         Err(error) => {
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
@@ -1397,13 +1415,19 @@ async fn host_session(
     }
 }
 
-fn handle_initialize(id: &Value, params: &Value, product_version: &str, tx: &producer::FrameSink) {
+fn handle_initialize(
+    id: &Value,
+    params: &Value,
+    product_version: &str,
+    tx: &producer::FrameSink,
+    air: bool,
+) {
     if let Err(error_response) = validate_initialize(id, params) {
         let _ = tx.send(error_response);
         return;
     }
     let result =
-        serde_json::to_value(types::initialize_result(product_version)).expect("serializes");
+        serde_json::to_value(types::initialize_result(product_version, air)).expect("serializes");
     let _ = tx.send(jsonrpc::response(id, &result));
 }
 
@@ -1558,16 +1582,20 @@ async fn handle_session_new(
         "sessionId": acp_session_id,
         "configOptions": *hosted.config.published.lock().await,
     });
+    if state.lock().await.air {
+        result["_meta"] = types::air_meta();
+    }
     if let Some(requested) = params.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
         let actual = actual_cwd.display().to_string();
         if !super::same_cwd(Path::new(requested), actual_cwd) {
-            result["_meta"] = meta::prime_agent_meta(&PrimeAgentSessionMeta {
+            let prime = meta::prime_agent_meta(&PrimeAgentSessionMeta {
                 cwd: Some(meta::PrimeAgentCwdMeta {
                     requested: requested.to_string(),
                     actual,
                 }),
                 ..Default::default()
             });
+            merge_meta(&mut result, prime);
         }
     }
     // Install the hosted session before the admission response leaves
@@ -2502,6 +2530,14 @@ async fn teardown(
     if let Some(hosted) = hosted {
         let _ = hosted.config.queue.lock().await;
         hosted.producer.close().await;
+    }
+}
+
+fn merge_meta(result: &mut Value, extra: impl serde::Serialize) {
+    let extra = serde_json::to_value(extra).unwrap_or(Value::Null);
+    match (result["_meta"].as_object_mut(), extra) {
+        (Some(existing), Value::Object(extra)) => existing.extend(extra),
+        (_, extra) => result["_meta"] = extra,
     }
 }
 
