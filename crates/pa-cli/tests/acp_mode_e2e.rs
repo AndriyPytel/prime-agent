@@ -393,6 +393,14 @@ fn acp_air_child_streams_as_a_native_subagent_session() {
         .to_string();
     assert_eq!(spawned["params"]["update"]["name"], "kid");
     let _ = client.wait_frame(TIMEOUT, |f| f["params"]["sessionId"] == child_id.as_str());
+    let done = client.wait_frame(TIMEOUT, |f| {
+        is_update(f, &session_id, "subagent_state_update")
+    });
+    assert_eq!(
+        done["params"]["update"]["subagentSessionId"],
+        child_id.as_str()
+    );
+    assert_eq!(done["params"]["update"]["state"], "completed");
 }
 
 #[test]

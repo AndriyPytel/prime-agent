@@ -306,6 +306,7 @@ pub(crate) struct HostedSession {
     /// The event mapping state lives and dies with the session, like TS.
     mapping: WireMappingState,
     observed_children: std::collections::HashSet<String>,
+    settled_children: std::collections::HashSet<String>,
     /// The one-shot `available_commands_update`; dropped with the session.
     commands_task: Option<tokio::task::JoinHandle<()>>,
     /// The settle task of a prompt that answered before the family went
@@ -583,11 +584,13 @@ fn spawn_event_consumer(
                         None;
                     let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
                     let mut new_child: Option<(WatchCtx, Value)> = None;
-                    let mut watching = false;
+                    let mut settled: Option<(WatchCtx, Arc<UpdateProducer>, String, &'static str)> =
+                        None;
                     {
                         let mut guard = state.lock().await;
                         let watch_ctx = guard.watch_ctx.clone();
-                        watching = guard.watching;
+                        let guard_ctx = watch_ctx.clone();
+                        let watching = guard.watching;
                         let Some(current) = guard.session.as_mut() else {
                             continue;
                         };
@@ -603,6 +606,21 @@ fn spawn_event_consumer(
                                 if current.observed_children.insert(id.to_string()) {
                                     new_child = watch_ctx.zip(event.get("child").cloned());
                                 }
+                            }
+                        }
+                        if let (Some(ctx), Some(child)) = (guard_ctx.as_ref(), event.get("child")) {
+                            let state = child_terminal_state(child);
+                            if state.is_some()
+                                && current.settled_children.insert(child_acp_id(child))
+                            {
+                                settled = state.map(|state| {
+                                    (
+                                        ctx.clone(),
+                                        Arc::clone(&current.producer),
+                                        child_acp_id(child),
+                                        state,
+                                    )
+                                });
                             }
                         }
                         let turn_id = current.producer.active_prompt_turn().await;
@@ -653,6 +671,11 @@ fn spawn_event_consumer(
                                 current.daemon_active_session_id.clone(),
                             ));
                         }
+                    }
+                    if let Some((ctx, producer, child_id, state)) = settled {
+                        tokio::spawn(async move {
+                            settle_watch_host(&ctx, &producer, &child_id, state).await;
+                        });
                     }
                     if let Some((ctx, child)) = new_child {
                         tokio::spawn(async move {
@@ -1608,6 +1631,7 @@ async fn handle_session_new(
         assistant_stop_reason: None,
         mapping: WireMappingState::default(),
         observed_children: std::collections::HashSet::new(),
+        settled_children: std::collections::HashSet::new(),
         commands_task: None,
         pending_terminal: None,
     };
@@ -2613,6 +2637,46 @@ fn unstreamed_assistant_text(event: &Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn child_terminal_state(child: &Value) -> Option<&'static str> {
+    match child.get("status").and_then(Value::as_str)? {
+        "done" => Some("completed"),
+        "error" => Some("failed"),
+        "cancelled" => Some("cancelled"),
+        _ => None,
+    }
+}
+
+/// Report a settled child on its parent, then detach and drop its watch
+/// host. The round trip first drains the events still queued on the link.
+async fn settle_watch_host(
+    ctx: &WatchCtx,
+    parent: &Arc<UpdateProducer>,
+    child_id: &str,
+    state: &str,
+) {
+    let host = ctx.hosts.lock().unwrap().remove(child_id);
+    if let Some(host) = &host {
+        let _ = fetch_rlm_children(&host.link, &host.binding.active_session_id).await;
+    }
+    let update = types::AcpSessionUpdate::SubagentStateUpdate {
+        subagent_session_id: child_id.to_string(),
+        state: state.to_string(),
+    };
+    let turn_id = parent.active_prompt_turn().await;
+    parent.publish_event(&update, turn_id, false).await;
+    if let Some(host) = host {
+        let _ = host
+            .link
+            .request(DaemonCommand::Detach {
+                id: None,
+                active_session_id: Some(host.binding.active_session_id.clone()),
+                rest: Map::default(),
+            })
+            .await;
+        host.consumer.abort();
+    }
+}
+
 fn child_acp_id(child: &Value) -> String {
     ["sessionId", "id"]
         .iter()
@@ -2661,6 +2725,7 @@ async fn open_watch_host(ctx: &WatchCtx, child: &Value) -> anyhow::Result<()> {
         assistant_stop_reason: None,
         mapping: WireMappingState::default(),
         observed_children: std::collections::HashSet::new(),
+        settled_children: std::collections::HashSet::new(),
         commands_task: None,
         pending_terminal: None,
     };
@@ -2740,6 +2805,8 @@ mod tests {
             assistant_stop_reason: None,
             mapping: WireMappingState::default(),
             observed_children: std::collections::HashSet::new(),
+            settled_children: std::collections::HashSet::new(),
+            settled_children: std::collections::HashSet::new(),
             commands_task: None,
             pending_terminal: None,
         }
