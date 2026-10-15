@@ -204,6 +204,38 @@ pub enum AcpSessionUpdate {
         subagent_session_id: String,
         state: String,
     },
+    /// An Air background task: a child still running after its parent's turn ended.
+    #[serde(rename = "async_task_spawned")]
+    AsyncTaskSpawned {
+        #[serde(rename = "asyncTaskId")]
+        async_task_id: String,
+        name: String,
+        #[serde(rename = "taskType")]
+        task_type: String,
+        description: String,
+        #[serde(rename = "showInTranscript")]
+        show_in_transcript: bool,
+        #[serde(rename = "outputFilePath", skip_serializing_if = "Option::is_none")]
+        output_file_path: Option<String>,
+    },
+    #[serde(rename = "async_task_progress")]
+    AsyncTaskProgress {
+        #[serde(rename = "asyncTaskId")]
+        async_task_id: String,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<Value>,
+    },
+    /// `running`, `paused`, `completed`, `failed` or `stopped`.
+    #[serde(rename = "async_task_state_update")]
+    AsyncTaskStateUpdate {
+        #[serde(rename = "asyncTaskId")]
+        async_task_id: String,
+        state: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
     /// Context window occupancy after an assistant message or compaction.
     #[serde(rename = "usage_update")]
     UsageUpdate { used: u64, size: u64 },

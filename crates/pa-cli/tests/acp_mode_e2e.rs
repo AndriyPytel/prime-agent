@@ -404,6 +404,31 @@ fn acp_air_child_streams_as_a_native_subagent_session() {
 }
 
 #[test]
+fn acp_air_child_outliving_the_turn_continues_as_a_background_task() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut client, session_id) = air_spawn_lane(6_000, &kernel_python);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let (_, updates) = client.wait_response(prompt, TIMEOUT);
+    let task = updates
+        .iter()
+        .find(|f| is_update(f, &session_id, "async_task_spawned"))
+        .expect("background task announced before the turn ends");
+    let task_id = task["params"]["update"]["asyncTaskId"].clone();
+    assert_eq!(task["params"]["update"]["name"], "kid");
+    let done = client.wait_frame(TIMEOUT, |f| {
+        is_update(f, &session_id, "async_task_state_update")
+    });
+    assert_eq!(done["params"]["update"]["asyncTaskId"], task_id);
+    assert_eq!(done["params"]["update"]["state"], "completed");
+    assert_eq!(done["params"]["update"]["summary"], "kid done");
+}
+
+#[test]
 fn acp_air_closing_a_child_tab_detaches_without_ending_the_child() {
     let Some(kernel_python) = kernel_python() else {
         return;
@@ -432,7 +457,7 @@ fn acp_air_closing_a_child_tab_detaches_without_ending_the_child() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let done = client.wait_frame(TIMEOUT, |f| {
-        is_update(f, &session_id, "subagent_state_update")
+        is_update(f, &session_id, "async_task_state_update")
     });
     assert_eq!(done["params"]["update"]["state"], "completed", "{done}");
 }
