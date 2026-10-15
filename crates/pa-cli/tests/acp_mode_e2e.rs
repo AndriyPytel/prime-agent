@@ -303,12 +303,15 @@ fn acp_initialize_matches_the_ts_golden() {
     let result = &response["result"];
     assert_eq!(result["protocolVersion"], 1);
     let capabilities = &result["agentCapabilities"];
-    assert_eq!(capabilities["loadSession"], false);
+    assert_eq!(capabilities["loadSession"], true);
     assert_eq!(
         capabilities["promptCapabilities"],
         json!({ "image": true, "embeddedContext": true })
     );
-    assert_eq!(capabilities["sessionCapabilities"], json!({ "close": {} }));
+    assert_eq!(
+        capabilities["sessionCapabilities"],
+        json!({ "close": {}, "resume": {}, "fork": {} })
+    );
     // ACP MCP server admission is served, so the http capability is advertised.
     assert_eq!(capabilities["mcpCapabilities"], json!({ "http": true }));
     let info = &result["agentInfo"];
@@ -2739,7 +2742,7 @@ fn acp_session_load_replays_history_before_the_response() {
     assert!(appended.contains("Name a river.") && appended.contains("Name a mountain."));
 }
 
-fn fork_params(first: &AcpChild, session_id: &str, meta: Value) -> Value {
+fn fork_params(first: &AcpChild, session_id: &str, meta: &Value) -> Value {
     json!({ "sessionId": session_id, "cwd": session_cwd(first), "mcpServers": [], "_meta": meta })
 }
 
@@ -2768,7 +2771,7 @@ fn acp_session_fork_copies_the_history_and_leaves_the_source_alone() {
     let init = second.request("initialize", &initialize_params());
     let _ = second.wait_response(init, TIMEOUT);
     let (forked_id, forked_file) =
-        fork_session(&mut second, &fork_params(&first, &session_id, json!({})));
+        fork_session(&mut second, &fork_params(&first, &session_id, &json!({})));
     assert_ne!(forked_id, session_id);
     assert_ne!(forked_file, file);
     assert!(std::fs::read_to_string(&forked_file)
@@ -2795,7 +2798,7 @@ fn acp_session_fork_at_an_air_fork_point_keeps_that_turn_only() {
         "version": 1,
         "messageId": format!("{first_user_id}:segment:0"),
     } } } });
-    let (_, forked_file) = fork_session(&mut second, &fork_params(&first, &session_id, meta));
+    let (_, forked_file) = fork_session(&mut second, &fork_params(&first, &session_id, &meta));
     let forked = std::fs::read_to_string(&forked_file).unwrap();
     assert!(forked.contains("Name a river.") && forked.contains("The Nile."));
     assert!(!forked.contains("Name a lake."), "{forked}");

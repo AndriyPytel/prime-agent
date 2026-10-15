@@ -43,9 +43,11 @@ pub struct McpCapabilities {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCapabilities {
     pub close: CloseCapability,
+    pub resume: CloseCapability,
+    pub fork: CloseCapability,
 }
 
-/// `{}`: present means `session/close` is served.
+/// `{}`: present means the session method is served.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CloseCapability {}
 
@@ -399,7 +401,7 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
     InitializeResult {
         protocol_version: 1,
         agent_capabilities: AgentCapabilities {
-            load_session: false,
+            load_session: true,
             prompt_capabilities: PromptCapabilities {
                 image: true,
                 embedded_context: true,
@@ -407,6 +409,8 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
             mcp_capabilities: Some(McpCapabilities { http: true }),
             session_capabilities: SessionCapabilities {
                 close: CloseCapability::default(),
+                resume: CloseCapability::default(),
+                fork: CloseCapability::default(),
             },
         },
         agent_info: AgentInfo {
@@ -431,10 +435,10 @@ mod tests {
             json!({
                 "protocolVersion": 1,
                 "agentCapabilities": {
-                    "loadSession": false,
+                    "loadSession": true,
                     "promptCapabilities": { "image": true, "embeddedContext": true },
                     "mcpCapabilities": { "http": true },
-                    "sessionCapabilities": { "close": {} },
+                    "sessionCapabilities": { "close": {}, "resume": {}, "fork": {} },
                 },
                 "agentInfo": { "name": "prime-agent", "title": "Prime Agent", "version": "9.9.9" },
                 "_meta": { "ai.primeintellect.prime-agent": {} },

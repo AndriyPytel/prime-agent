@@ -750,7 +750,7 @@ mod tests {
         ];
         let kinds: Vec<Value> = replay_updates(&rows)
             .iter()
-            .map(|update| update.to_bare_value())
+            .map(super::super::types::AcpSessionUpdate::to_bare_value)
             .map(|value| json!([value["sessionUpdate"], value["messageId"], value["status"]]))
             .collect();
         assert_eq!(

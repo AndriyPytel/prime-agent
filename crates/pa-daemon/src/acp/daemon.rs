@@ -240,6 +240,9 @@ impl DaemonLink {
     }
 }
 
+pub type FreshCreate = Arc<dyn Fn(&Path, Option<PathBuf>) -> DaemonCommand + Send + Sync>;
+pub type ResolveSession = Arc<dyn Fn(&str, &Path) -> Result<PathBuf, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct DaemonAcpOptions {
     pub socket_path: PathBuf,
@@ -250,9 +253,9 @@ pub struct DaemonAcpOptions {
     pub first_cwd: PathBuf,
     /// Builds the `create` of every later session for a cwd and an
     /// optional existing session file.
-    pub fresh_create: Arc<dyn Fn(&Path, Option<PathBuf>) -> DaemonCommand + Send + Sync>,
+    pub fresh_create: FreshCreate,
     /// Resolves a session id or path selector to its session file.
-    pub resolve_session: Arc<dyn Fn(&str, &Path) -> Result<PathBuf, String> + Send + Sync>,
+    pub resolve_session: ResolveSession,
     pub session_dir: PathBuf,
 }
 
@@ -1196,15 +1199,14 @@ async fn open_new_session(
         .and_then(Value::as_str)
         .filter(|cwd| !cwd.is_empty())
         .map(PathBuf::from);
-    let (cwd, create) = match first {
-        Some(first) => first,
-        None => {
-            let cwd = requested_cwd
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| options.first_cwd.clone());
-            let create = (options.fresh_create)(&cwd, None);
-            (cwd, create)
-        }
+    let (cwd, create) = if let Some(first) = first {
+        first
+    } else {
+        let cwd = requested_cwd
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| options.first_cwd.clone());
+        let create = (options.fresh_create)(&cwd, None);
+        (cwd, create)
     };
     let host = match open_host(&options.socket_path, cwd, create).await {
         Ok(host) => host,
@@ -1301,7 +1303,7 @@ async fn open_existing_session(
     host_session(id, &params, &session_id, host, &history, hosts, tx.clone()).await;
 }
 
-/// Copy the source session into a new file for `cwd`. The JetBrains Air
+/// Copy the source session into a new file for `cwd`. The `JetBrains` Air
 /// fork point keeps the user turn it names and everything before it.
 fn fork_session_file(
     source: &Path,
@@ -1317,7 +1319,7 @@ fn fork_session_file(
             .map_err(|error| format!("{error:#}"))?;
         forked.header.cwd = cwd.display().to_string();
         forked.rewrite().map_err(|error| format!("{error:#}"))?;
-        return Ok(forked.path.clone());
+        return Ok(forked.path);
     }
     let forked = pa_core::session::manager::SessionManager::fork_from(source, cwd, session_dir)?;
     forked
