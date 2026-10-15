@@ -573,15 +573,6 @@ fn acp_error_shapes_match_the_ts_goldens() {
         .unwrap()
         .to_string();
 
-    // A second session/new on a live connection (ts-errors.jsonl).
-    let again = client.request("session/new", &json!({ "mcpServers": [] }));
-    let (response, _) = client.wait_response(again, TIMEOUT);
-    assert_eq!(response["error"]["code"], -32603);
-    assert_eq!(
-        response["error"]["data"]["details"],
-        "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session"
-    );
-
     // Unknown method (ts-errors.jsonl).
     let unknown = client.request("unknown/method", &json!({}));
     let (response, _) = client.wait_response(unknown, TIMEOUT);
@@ -689,7 +680,7 @@ fn acp_mcp_admission_accepts_valid_servers_and_close_releases() {
 }
 
 #[test]
-fn acp_mcp_admission_rejects_a_second_session_only_when_open() {
+fn acp_mcp_admission_hosts_a_second_session_beside_the_first() {
     let script = json!({ "responses": ["unused"] });
     let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
     let init = client.request("initialize", &initialize_params());
@@ -712,12 +703,10 @@ fn acp_mcp_admission_rejects_a_second_session_only_when_open() {
         ]}),
     );
     let (second_response, _) = client.wait_response(second, TIMEOUT);
-    assert_eq!(second_response["error"]["code"], -32603);
-    assert_eq!(second_response["error"]["message"], "Internal error");
-    assert_eq!(
-        second_response["error"]["data"]["details"],
-        "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session"
-    );
+    let second_id = second_response["result"]["sessionId"]
+        .as_str()
+        .expect("a second session is admitted");
+    assert_ne!(second_id, session_id);
     let close = client.request("session/close", &json!({ "sessionId": session_id }));
     let (close_response, _) = client.wait_response(close, TIMEOUT);
     assert_eq!(close_response["result"], json!({}));
@@ -1310,7 +1299,7 @@ fn acp_daemon_attached_eof_during_session_new_exits() {
 }
 
 #[test]
-fn acp_daemon_attached_close_keeps_the_worker_and_new_rebinds_it() {
+fn acp_daemon_attached_close_ends_the_owned_worker_and_new_hosts_a_fresh_one() {
     let mut client = AcpChild::spawn(
         &["--mode", "acp", "--no-session"],
         &json!({ "engine": "faux", "responses": ["The Nile.", "Everest."] }),
@@ -1332,10 +1321,6 @@ fn acp_daemon_attached_close_keeps_the_worker_and_new_rebinds_it() {
     let close = client.request("session/close", &json!({ "sessionId": first }));
     let (close_response, _) = client.wait_response(close, TIMEOUT);
     assert_eq!(close_response["result"], json!({}));
-    let sessions = live_sessions(&socket);
-    assert_eq!(sessions.len(), 1, "close keeps the worker: {sessions:?}");
-    assert_eq!(sessions[0]["activeSessionId"], active_session_id);
-
     let second = new_session(&mut client);
     assert_ne!(second, first);
     let updates = assert_prompt_ends_turn(&mut client, &second, "Name a mountain.");
@@ -1349,10 +1334,12 @@ fn acp_daemon_attached_close_keeps_the_worker_and_new_rebinds_it() {
         "prime-agent-assistant-1"
     );
     let sessions = live_sessions(&socket);
-    assert_eq!(sessions.len(), 1, "{sessions:?}");
-    assert_eq!(
-        sessions[0]["activeSessionId"], active_session_id,
-        "session/new binds the same daemon session"
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["activeSessionId"].is_string()
+                && session["activeSessionId"] != active_session_id),
+        "session/new hosts a fresh daemon session: {sessions:?}"
     );
 }
 
@@ -2601,14 +2588,6 @@ fn acp_daemon_attached_close_stop_failure_fences_the_session() {
         "a prompt while the stop failed answers the TS fence: {prompt_response}"
     );
 
-    let refused = client.request("session/new", &json!({ "mcpServers": [] }));
-    let (refused_response, _) = client.wait_response(refused, TIMEOUT);
-    assert_eq!(
-        refused_response["error"]["data"]["details"],
-        "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session",
-        "the close-failed session keeps the single-session slot: {refused_response}"
-    );
-
     let close_again = client.request("session/close", &json!({ "sessionId": session_id }));
     let (again_response, _) = client.wait_response(close_again, TIMEOUT);
     assert_eq!(again_response["error"]["code"], -32603);
@@ -2621,38 +2600,21 @@ fn acp_daemon_attached_close_stop_failure_fences_the_session() {
 }
 
 #[test]
-fn acp_daemon_attached_close_holds_the_input_pause_until_the_next_session_new() {
+fn acp_one_connection_hosts_two_independent_sessions() {
     let mut client = AcpChild::spawn(
         &["--mode", "acp", "--no-session"],
-        &json!({ "engine": "faux", "responses": ["first", { "text": "FOREIGN", "delayMs": 150_000 }] }),
+        &json!({ "engine": "faux", "responses": ["The Nile.", "Everest."] }),
     );
-    let socket = client.socket.clone();
-    let session_id = initialize_and_new_session(&mut client);
-    assert_prompt_ends_turn(&mut client, &session_id, "one");
-
-    let close = client.request("session/close", &json!({ "sessionId": session_id }));
-    let (close_response, _) = client.wait_response(close, TIMEOUT);
-    assert_eq!(close_response["result"], json!({}));
-
-    let active_session_id = live_sessions(&socket)[0]["activeSessionId"]
-        .as_str()
-        .expect("the resident session")
-        .to_string();
-    let _ = daemon_request(
-        &socket,
-        "foreign-follow-up",
-        &json!({ "type": "follow_up", "activeSessionId": active_session_id, "message": "foreign" }),
-    );
-    let idle = daemon_request(
-        &socket,
-        "foreign-idle",
-        &json!({ "type": "wait_for_idle", "activeSessionId": active_session_id }),
-    );
-    assert!(
-        idle["success"] == json!(true),
-        "no foreign turn runs on the resident session while the close holds the input pause: {idle}"
-    );
-
-    let _second = new_session(&mut client);
-    drop(client);
+    let first = initialize_and_new_session(&mut client);
+    let second = new_session(&mut client);
+    assert_ne!(first, second);
+    let first_updates = assert_prompt_ends_turn(&mut client, &first, "Name a river.");
+    let second_updates = assert_prompt_ends_turn(&mut client, &second, "Name a mountain.");
+    for (id, updates) in [(&first, first_updates), (&second, second_updates)] {
+        let chunk = updates
+            .iter()
+            .find(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .expect("a message chunk");
+        assert_eq!(chunk["params"]["sessionId"], json!(id));
+    }
 }

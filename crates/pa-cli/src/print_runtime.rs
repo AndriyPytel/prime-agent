@@ -103,12 +103,35 @@ async fn acp_mode_main(options: &RunOptions) -> Result<i32, String> {
     crate::interactive_mode::ensure_daemon_running(&socket_path, &options.config.cwd)
         .await
         .map_err(|error| format!("{error:#}"))?;
-    let (actual_cwd, create) = daemon_acp_create(options)?;
+    let (first_cwd, first_create) = daemon_acp_create(options)?;
+    let session_dir = replacement_session_dir(options);
+    let fresh_options = options.clone();
+    let resolve_dir = session_dir.clone();
     pa_daemon::acp::daemon::run_daemon_attached_acp_mode(pa_daemon::acp::daemon::DaemonAcpOptions {
         socket_path,
-        actual_cwd,
         product_version: crate::config::version().to_string(),
-        create,
+        first_cwd,
+        first_create,
+        fresh_create: std::sync::Arc::new(move |cwd, session_path| {
+            acp_create_command(
+                &fresh_options,
+                cwd,
+                session_path,
+                pa_types::daemon::DaemonSessionLifecycle::Resident,
+            )
+        }),
+        resolve_session: std::sync::Arc::new(move |selector, cwd| {
+            match resolve_session_path(selector, cwd, &resolve_dir)
+                .map_err(|error| render_selector_error(&error))?
+            {
+                ResolvedSession::Path(path)
+                | ResolvedSession::Local(path)
+                | ResolvedSession::Global { path, .. } => {
+                    std::path::absolute(&path).map_err(|error| error.to_string())
+                }
+            }
+        }),
+        session_dir,
     })
     .await
     .map_err(|error| format!("{error:#}"))
@@ -151,6 +174,21 @@ fn daemon_acp_create(
         };
         (cwd, session_path, DaemonSessionLifecycle::Resident)
     };
+    let create = acp_create_command(options, &cwd, session_path, lifecycle);
+    Ok((cwd, create))
+}
+
+/// The ACP daemon session's `create` for one cwd and optional session
+/// file, shared by the startup session and every later one.
+fn acp_create_command(
+    options: &RunOptions,
+    cwd: &std::path::Path,
+    session_path: Option<std::path::PathBuf>,
+    lifecycle: pa_types::daemon::DaemonSessionLifecycle,
+) -> pa_types::daemon::DaemonCommand {
+    use pa_types::daemon::DaemonSessionLifecycle;
+    let config = &options.config;
+    let session_dir = replacement_session_dir(options);
     // The CLI session flags, under the TS `runtimeConfigFromArgs`
     // names. `--api-key` stays off: the create config is persisted.
     let mut create_config = serde_json::json!({
@@ -201,11 +239,11 @@ fn daemon_acp_create(
         create_config["childScript"] =
             serde_json::Value::String(child_script.to_string_lossy().to_string());
     }
-    let create = pa_types::daemon::DaemonCommand::Create {
+    pa_types::daemon::DaemonCommand::Create {
         id: None,
         session_path: session_path.map(|path| path.display().to_string()),
         continue_recent: None,
-        no_session: options.session.no_session.then_some(true),
+        no_session: matches!(lifecycle, DaemonSessionLifecycle::ClientOwned).then_some(true),
         name: None,
         config: Some(create_config),
         telemetry_disabled: crate::mode::create_telemetry_disabled(config),
@@ -214,8 +252,7 @@ fn daemon_acp_create(
         env: None,
         launch_env: None,
         rest: serde_json::Map::default(),
-    };
-    Ok((cwd, create))
+    }
 }
 
 fn run_rpc_mode(options: &RunOptions) -> Result<i32, String> {

@@ -2,9 +2,10 @@
 //! over a daemon session (TS
 //! `runAcpModeWithConnection(DaemonAgentConnection)`).
 //!
-//! Startup creates and attaches the daemon session the CLI session flags
-//! select. `session/new` binds it, admits its MCP servers through the
-//! `replace_acp_mcp_servers` wire command, and every prompt runs
+//! One connection hosts many sessions, each with its own daemon link. The
+//! first `session/new` creates the session the CLI session flags select;
+//! later ones create fresh sessions. `session/new` admits its MCP servers
+//! through the `replace_acp_mcp_servers` wire command, and every prompt runs
 //! `prompt_and_wait` while the streamed session events fan out as ACP
 //! updates. The turn settlement (response boundary, completion envelope
 //! with the live outstanding-subagent count, terminal frame after the RLM
@@ -242,14 +243,32 @@ impl DaemonLink {
 #[derive(Clone)]
 pub struct DaemonAcpOptions {
     pub socket_path: PathBuf,
-    pub actual_cwd: PathBuf,
     pub product_version: String,
-    /// The startup `create` built from the CLI session flags.
-    pub create: DaemonCommand,
+    /// The `create` built from the CLI session flags; the first
+    /// `session/new` runs it in `first_cwd`.
+    pub first_create: DaemonCommand,
+    pub first_cwd: PathBuf,
+    /// Builds the `create` of every later session for a cwd and an
+    /// optional existing session file.
+    pub fresh_create: Arc<dyn Fn(&Path, Option<PathBuf>) -> DaemonCommand + Send + Sync>,
+    /// Resolves a session id or path selector to its session file.
+    pub resolve_session: Arc<dyn Fn(&str, &Path) -> Result<PathBuf, String> + Send + Sync>,
+    pub session_dir: PathBuf,
 }
 
-/// The daemon session this connection created at startup; every
-/// `session/new` binds it.
+/// One hosted session: its own daemon connection, state and binding.
+#[derive(Clone)]
+struct SessionHost {
+    link: Arc<DaemonLink>,
+    state: Arc<Mutex<DaemonAcpState>>,
+    binding: DaemonBinding,
+    cwd: PathBuf,
+    consumer: tokio::task::AbortHandle,
+}
+
+type Hosts = Arc<std::sync::Mutex<HashMap<String, SessionHost>>>;
+
+/// The daemon session one host created and attached.
 #[derive(Clone)]
 struct DaemonBinding {
     active_session_id: String,
@@ -311,7 +330,6 @@ struct ActiveTurn {
 #[derive(Default)]
 pub(crate) struct DaemonAcpState {
     pub(crate) session: Option<HostedSession>,
-    pub(crate) session_new_in_flight: bool,
     pub(crate) session_close_done: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) closed_input_pause_id: Option<String>,
     pub(crate) closed_input_pause_key: Option<String>,
@@ -325,7 +343,7 @@ pub(crate) struct DaemonAcpState {
 /// # Errors
 ///
 /// Returns an error, before any ACP frame is written, when the daemon
-/// socket connect, the startup create, or its attach fails; a daemon that
+/// socket connect fails; a daemon that
 /// drops mid-session fails the hosted session's requests instead, exactly
 /// like the TS daemon connection.
 ///
@@ -351,141 +369,10 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         }
     });
 
-    let link = Arc::new(DaemonLink::connect(&options.socket_path).await?);
-    let state = Arc::new(Mutex::new(DaemonAcpState::default()));
-
-    {
-        let link = Arc::clone(&link);
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut frames = link.frames.lock().await;
-            while let Some(frame) = frames.recv().await {
-                match frame {
-                    LinkFrame::Event(frame) => {
-                        let event = frame.get("event").cloned().unwrap_or(Value::Null);
-                        // The refresh triggers: runs that can restore a
-                        // failover model or clamp a level. Captured under
-                        // the guard, spawned once released.
-                        let mut refresh: Option<(Arc<HostedConfig>, Arc<UpdateProducer>, String)> =
-                            None;
-                        let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
-                        {
-                            let mut guard = state.lock().await;
-                            let Some(current) = guard.session.as_mut() else {
-                                continue;
-                            };
-                            if let Some(stop) = wire_events::assistant_stop(&event) {
-                                current.assistant_stop_reason = stop.stop_reason;
-                            }
-                            if event.get("type").and_then(Value::as_str) == Some("rlm_child_update")
-                            {
-                                if let Some(id) = event
-                                    .get("child")
-                                    .and_then(|child| child.get("id"))
-                                    .and_then(Value::as_str)
-                                {
-                                    current.observed_children.insert(id.to_string());
-                                }
-                            }
-                            let turn_id = current.producer.active_prompt_turn().await;
-                            for update in wire_events::wire_updates(&event, &mut current.mapping) {
-                                current
-                                    .producer
-                                    .publish_event(&update, turn_id, current.mapping.streaming)
-                                    .await;
-                            }
-                            current
-                                .producer
-                                .flush_deferred(current.mapping.streaming)
-                                .await;
-                            if changes_context_usage(&event) {
-                                usage_fetch = Some((
-                                    Arc::clone(&current.producer),
-                                    current.daemon_active_session_id.clone(),
-                                    turn_id,
-                                ));
-                            }
-                            if matches!(
-                                event.get("type").and_then(Value::as_str),
-                                Some("agent_end" | "auto_retry_start" | "auto_retry_end")
-                            ) {
-                                refresh = Some((
-                                    Arc::clone(&current.config),
-                                    Arc::clone(&current.producer),
-                                    current.daemon_active_session_id.clone(),
-                                ));
-                            }
-                        }
-                        if let Some((producer, daemon_session_id, turn_id)) = usage_fetch {
-                            let link = Arc::clone(&link);
-                            let state = Arc::clone(&state);
-                            tokio::spawn(async move {
-                                publish_usage_update(
-                                    &link,
-                                    &state,
-                                    &daemon_session_id,
-                                    &producer,
-                                    turn_id,
-                                )
-                                .await;
-                            });
-                        }
-                        if let Some((config, producer, daemon_session_id)) = refresh {
-                            let link = Arc::clone(&link);
-                            tokio::spawn(async move {
-                                let _guard = config.queue.lock().await;
-                                // The background trigger drops refresh
-                                // failures (TS `.catch(() => undefined)`).
-                                let _ = refresh_wire_config(
-                                    &link,
-                                    &daemon_session_id,
-                                    &config,
-                                    &producer,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                    LinkFrame::Response(response) => {
-                        let id = response.id.clone().unwrap_or_default();
-                        if let Some(tx) = link.pending.lock().unwrap().remove(&id) {
-                            let _ = tx.send(response);
-                        }
-                    }
-                    // Heartbeats are connection-scoped, not session events,
-                    // so the consumer maps the broadcast directly instead of
-                    // `wire_updates`: TS publishes the change at origin turn 0
-                    // even while a prompt runs.
-                    LinkFrame::HeartbeatsChanged => {
-                        let guard = state.lock().await;
-                        if let Some(current) = guard.session.as_ref() {
-                            current
-                                .producer
-                                .publish_event(
-                                    &types::AcpSessionUpdate::SessionInfoUpdate {
-                                        meta: meta::prime_agent_meta(&PrimeAgentSessionMeta {
-                                            heartbeats_changed: Some(true),
-                                            ..Default::default()
-                                        }),
-                                    },
-                                    0,
-                                    current.mapping.streaming,
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-            // The reader hit the socket close and every frame it read
-            // has been delivered: fail the still-pending requests
-            // (dropping a sender answers with the mid-request error)
-            // and fail every later request fast. The flag goes up
-            // before the clear; `request` covers the race.
-            link.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-            link.pending.lock().unwrap().clear();
-        });
-    }
-    let binding = bind_daemon_session(&link, &state, options.create.clone()).await?;
+    let probe = DaemonLink::connect(&options.socket_path).await?;
+    drop(probe);
+    let hosts: Hosts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mut first = Some((options.first_cwd.clone(), options.first_create.clone()));
 
     // Only the prompt handlers stay owned: EOF aborts them (TS aborts the
     // controller and exits), so the process never waits on a prompt still
@@ -511,40 +398,68 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                 continue;
             }
         };
+        let method = match &incoming {
+            Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
+                method.as_str()
+            }
+        };
+        if method == "session/new" {
+            if let Incoming::Request { id, params, .. } = incoming {
+                let cwd_pick = first.take();
+                open_new_session(id, params, cwd_pick, &options, &hosts, &tx).await;
+            }
+            continue;
+        }
+        let session_id = match &incoming {
+            Incoming::Request { params, .. } | Incoming::Notification { params, .. } => params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        let Some(session_id) = session_id else {
+            let options = options.clone();
+            let options_tx = tx.clone();
+            tokio::spawn(async move {
+                handle_incoming(incoming, None, &options, options_tx).await;
+            });
+            continue;
+        };
+        let host = hosts.lock().unwrap().get(&session_id).cloned();
+        let Some(host) = host else {
+            if let Incoming::Request { id, .. } = &incoming {
+                let _ = tx.send(super::internal_error(
+                    id,
+                    &format!("Unknown ACP session: {session_id}"),
+                ));
+            }
+            continue;
+        };
         // Handlers run concurrently (like the TS acp agent's request
         // handling): a prompt turn may span minutes, and `session/cancel`
         // must reach the daemon while it is in flight. The state machine
-        // (one hosted session, one in-flight close) keeps the concurrency
-        // bounded. Prompt admission and cancel marking run here, in frame
-        // order (TS runs a request's synchronous prefix before the next
-        // frame's handler).
+        // (one in-flight close per host) keeps the concurrency bounded.
+        // Prompt admission and cancel marking run here, in frame order (TS
+        // runs a request's synchronous prefix before the next frame's
+        // handler).
+        let SessionHost {
+            link,
+            state,
+            binding,
+            ..
+        } = host.clone();
         match frame_order_prefix(&incoming, &state).await {
             FrameOrder::Spawn => {
-                // `session/new` settles before the next frame is read, so
-                // EOF's teardown always sees the session it installs.
-                if matches!(&incoming, Incoming::Request { method, .. } if method == "session/new")
-                {
-                    let options_tx = tx.clone();
-                    handle_incoming(incoming, &link, &state, &options, &binding, options_tx).await;
-                } else {
-                    let link = Arc::clone(&link);
-                    let state = Arc::clone(&state);
-                    let options = options.clone();
-                    let binding = binding.clone();
-                    let options_tx = tx.clone();
-                    tokio::spawn(async move {
-                        handle_incoming(incoming, &link, &state, &options, &binding, options_tx)
-                            .await;
-                    });
-                }
+                let options = options.clone();
+                let options_tx = tx.clone();
+                tokio::spawn(async move {
+                    handle_incoming(incoming, Some(&host), &options, options_tx).await;
+                });
             }
             FrameOrder::AdmitPrompt {
                 id,
                 params,
                 admission_id,
             } => {
-                let link = Arc::clone(&link);
-                let state = Arc::clone(&state);
                 let options_tx = tx.clone();
                 handlers.spawn(async move {
                     handle_session_prompt(id, params, admission_id, &link, &state, options_tx)
@@ -557,18 +472,27 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                 let _ = tx.send(super::internal_error(&id, &message));
             }
             FrameOrder::Close { id, params, done } => {
-                let link = Arc::clone(&link);
-                let state = Arc::clone(&state);
                 let options_tx = tx.clone();
-                let owner_id = binding.mcp_owner_id.clone();
+                let hosts = Arc::clone(&hosts);
                 tokio::spawn(async move {
-                    handle_session_close(id, params, &link, &state, options_tx, done, owner_id)
-                        .await;
+                    handle_session_close(
+                        id,
+                        params,
+                        &link,
+                        &state,
+                        options_tx,
+                        done,
+                        binding.mcp_owner_id.clone(),
+                    )
+                    .await;
+                    if state.lock().await.session.is_none() {
+                        hosts.lock().unwrap().remove(&session_id);
+                        teardown(&link, &state, &binding).await;
+                        host.consumer.abort();
+                    }
                 });
             }
             FrameOrder::Cancel(order) => {
-                let link = Arc::clone(&link);
-                let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let mut order = order;
                     loop {
@@ -593,16 +517,152 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
 
     handlers.shutdown().await;
     // A close frame is reserved synchronously but its stop runs detached.
-    // Let it finish before EOF teardown takes the hosted session away.
-    wait_for_session_close(&state).await;
-    teardown(&link, &state, &binding).await;
+    // Let it finish before EOF teardown takes each hosted session away.
+    let remaining: Vec<SessionHost> = hosts.lock().unwrap().values().cloned().collect();
+    let mut teardowns = tokio::task::JoinSet::new();
+    for host in remaining {
+        teardowns.spawn(async move {
+            wait_for_session_close(&host.state).await;
+            teardown(&host.link, &host.state, &host.binding).await;
+        });
+    }
+    while teardowns.join_next().await.is_some() {}
     drop(tx);
     let _ = writer.await;
     Ok(0)
 }
 
-/// Create and attach the startup daemon session (TS main.ts, before the
-/// ACP connection serves). A failed attach releases the created session
+/// The event-consumer task of one host's link.
+fn spawn_event_consumer(
+    link: Arc<DaemonLink>,
+    state: Arc<Mutex<DaemonAcpState>>,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        let mut frames = link.frames.lock().await;
+        while let Some(frame) = frames.recv().await {
+            match frame {
+                LinkFrame::Event(frame) => {
+                    let event = frame.get("event").cloned().unwrap_or(Value::Null);
+                    // The refresh triggers: runs that can restore a
+                    // failover model or clamp a level. Captured under
+                    // the guard, spawned once released.
+                    let mut refresh: Option<(Arc<HostedConfig>, Arc<UpdateProducer>, String)> =
+                        None;
+                    let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
+                    {
+                        let mut guard = state.lock().await;
+                        let Some(current) = guard.session.as_mut() else {
+                            continue;
+                        };
+                        if let Some(stop) = wire_events::assistant_stop(&event) {
+                            current.assistant_stop_reason = stop.stop_reason;
+                        }
+                        if event.get("type").and_then(Value::as_str) == Some("rlm_child_update") {
+                            if let Some(id) = event
+                                .get("child")
+                                .and_then(|child| child.get("id"))
+                                .and_then(Value::as_str)
+                            {
+                                current.observed_children.insert(id.to_string());
+                            }
+                        }
+                        let turn_id = current.producer.active_prompt_turn().await;
+                        for update in wire_events::wire_updates(&event, &mut current.mapping) {
+                            current
+                                .producer
+                                .publish_event(&update, turn_id, current.mapping.streaming)
+                                .await;
+                        }
+                        current
+                            .producer
+                            .flush_deferred(current.mapping.streaming)
+                            .await;
+                        if changes_context_usage(&event) {
+                            usage_fetch = Some((
+                                Arc::clone(&current.producer),
+                                current.daemon_active_session_id.clone(),
+                                turn_id,
+                            ));
+                        }
+                        if matches!(
+                            event.get("type").and_then(Value::as_str),
+                            Some("agent_end" | "auto_retry_start" | "auto_retry_end")
+                        ) {
+                            refresh = Some((
+                                Arc::clone(&current.config),
+                                Arc::clone(&current.producer),
+                                current.daemon_active_session_id.clone(),
+                            ));
+                        }
+                    }
+                    if let Some((producer, daemon_session_id, turn_id)) = usage_fetch {
+                        let link = Arc::clone(&link);
+                        let state = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            publish_usage_update(
+                                &link,
+                                &state,
+                                &daemon_session_id,
+                                &producer,
+                                turn_id,
+                            )
+                            .await;
+                        });
+                    }
+                    if let Some((config, producer, daemon_session_id)) = refresh {
+                        let link = Arc::clone(&link);
+                        tokio::spawn(async move {
+                            let _guard = config.queue.lock().await;
+                            // The background trigger drops refresh
+                            // failures (TS `.catch(() => undefined)`).
+                            let _ =
+                                refresh_wire_config(&link, &daemon_session_id, &config, &producer)
+                                    .await;
+                        });
+                    }
+                }
+                LinkFrame::Response(response) => {
+                    let id = response.id.clone().unwrap_or_default();
+                    if let Some(tx) = link.pending.lock().unwrap().remove(&id) {
+                        let _ = tx.send(response);
+                    }
+                }
+                // Heartbeats are connection-scoped, not session events,
+                // so the consumer maps the broadcast directly instead of
+                // `wire_updates`: TS publishes the change at origin turn 0
+                // even while a prompt runs.
+                LinkFrame::HeartbeatsChanged => {
+                    let guard = state.lock().await;
+                    if let Some(current) = guard.session.as_ref() {
+                        current
+                            .producer
+                            .publish_event(
+                                &types::AcpSessionUpdate::SessionInfoUpdate {
+                                    meta: meta::prime_agent_meta(&PrimeAgentSessionMeta {
+                                        heartbeats_changed: Some(true),
+                                        ..Default::default()
+                                    }),
+                                },
+                                0,
+                                current.mapping.streaming,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        // The reader hit the socket close and every frame it read
+        // has been delivered: fail the still-pending requests
+        // (dropping a sender answers with the mid-request error)
+        // and fail every later request fast. The flag goes up
+        // before the clear; `request` covers the race.
+        link.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        link.pending.lock().unwrap().clear();
+    })
+    .abort_handle()
+}
+
+/// Create and attach one host's daemon session (TS main.ts). A failed attach releases the created session
 /// the way EOF does.
 async fn bind_daemon_session(
     link: &Arc<DaemonLink>,
@@ -1053,26 +1113,21 @@ async fn release_session_input_pause(
 /// One incoming ACP frame. Requests answer.
 async fn handle_incoming(
     incoming: Incoming,
-    link: &Arc<DaemonLink>,
-    state: &Arc<Mutex<DaemonAcpState>>,
+    host: Option<&SessionHost>,
     options: &DaemonAcpOptions,
-    binding: &DaemonBinding,
     tx: producer::FrameSink,
 ) {
     let Incoming::Request { id, method, params } = incoming else {
         return;
     };
-    match method.as_str() {
-        "initialize" => {
+    match (method.as_str(), host) {
+        ("initialize", _) => {
             handle_initialize(&id, &params, &options.product_version, &tx);
         }
-        "session/new" => {
-            handle_session_new(id, params, link, state, options, binding, tx).await;
+        ("session/set_config_option", Some(host)) => {
+            handle_set_config_option(id, params, &host.link, &host.state, tx).await;
         }
-        "session/set_config_option" => {
-            handle_set_config_option(id, params, link, state, tx).await;
-        }
-        other => {
+        (other, _) => {
             let _ = tx.send(jsonrpc::error_response(
                 &id,
                 jsonrpc::METHOD_NOT_FOUND,
@@ -1080,6 +1135,87 @@ async fn handle_incoming(
                 Some(&json!({ "method": other })),
             ));
         }
+    }
+}
+
+async fn open_host(
+    socket_path: &Path,
+    cwd: PathBuf,
+    create: DaemonCommand,
+) -> anyhow::Result<SessionHost> {
+    let link = Arc::new(DaemonLink::connect(socket_path).await?);
+    let state = Arc::new(Mutex::new(DaemonAcpState::default()));
+    let consumer = spawn_event_consumer(Arc::clone(&link), Arc::clone(&state));
+    match bind_daemon_session(&link, &state, create).await {
+        Ok(binding) => Ok(SessionHost {
+            link,
+            state,
+            binding,
+            cwd,
+            consumer,
+        }),
+        Err(error) => {
+            consumer.abort();
+            Err(error)
+        }
+    }
+}
+
+/// Host a new session: the first one runs the CLI-flag create, later
+/// ones a fresh create in the requested cwd.
+async fn open_new_session(
+    id: Value,
+    params: Value,
+    first: Option<(PathBuf, DaemonCommand)>,
+    options: &DaemonAcpOptions,
+    hosts: &Hosts,
+    tx: &producer::FrameSink,
+) {
+    let requested_cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from);
+    let (cwd, create) = match first {
+        Some(first) => first,
+        None => {
+            let cwd = requested_cwd
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| options.first_cwd.clone());
+            let create = (options.fresh_create)(&cwd, None);
+            (cwd, create)
+        }
+    };
+    let host = match open_host(&options.socket_path, cwd, create).await {
+        Ok(host) => host,
+        Err(error) => {
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+            return;
+        }
+    };
+    let acp_session_id = uuid::Uuid::new_v4().to_string();
+    host_session(id, &params, &acp_session_id, host, hosts, tx.clone()).await;
+}
+
+/// Register the host, run the admission, and drop the host again when
+/// the admission failed.
+async fn host_session(
+    id: Value,
+    params: &Value,
+    acp_session_id: &str,
+    host: SessionHost,
+    hosts: &Hosts,
+    tx: producer::FrameSink,
+) {
+    hosts
+        .lock()
+        .unwrap()
+        .insert(acp_session_id.to_string(), host.clone());
+    handle_session_new(id, params.clone(), acp_session_id, &host, tx).await;
+    if host.state.lock().await.session.is_none() {
+        hosts.lock().unwrap().remove(acp_session_id);
+        teardown(&host.link, &host.state, &host.binding).await;
+        host.consumer.abort();
     }
 }
 
@@ -1124,26 +1260,17 @@ fn validate_initialize(id: &Value, params: &Value) -> std::result::Result<(), Va
 async fn handle_session_new(
     id: Value,
     params: Value,
-    link: &Arc<DaemonLink>,
-    state: &Arc<Mutex<DaemonAcpState>>,
-    options: &DaemonAcpOptions,
-    binding: &DaemonBinding,
+    acp_session_id: &str,
+    host: &SessionHost,
     tx: producer::FrameSink,
 ) {
-    {
-        let mut guard = state.lock().await;
-        if guard.session.is_some()
-            || guard.session_new_in_flight
-            || guard.session_close_done.is_some()
-        {
-            let _ = tx.send(super::internal_error(
-                &id,
-                "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session",
-            ));
-            return;
-        }
-        guard.session_new_in_flight = true;
-    }
+    let SessionHost {
+        link,
+        state,
+        binding,
+        cwd: actual_cwd,
+        ..
+    } = host;
     let params = types::NewSessionParams::parse(&params);
     if !state.lock().await.mcp_server_names.is_empty() {
         if let Err(error) = clear_connection_servers(
@@ -1154,35 +1281,30 @@ async fn handle_session_new(
         )
         .await
         {
-            state.lock().await.session_new_in_flight = false;
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
             return;
         }
     }
     // MCP admission runs after the pending-clear retry: a rejected list
     // fails the request with the same error payloads.
-    let resolved =
-        match super::mcp::resolve_acp_mcp_servers(&params.mcp_servers, &options.actual_cwd) {
-            Ok(resolved) => resolved,
-            Err(reason) => {
-                state.lock().await.session_new_in_flight = false;
-                let _ = tx.send(jsonrpc::error_response(
-                    &id,
-                    jsonrpc::INVALID_PARAMS,
-                    "Invalid params",
-                    Some(&json!({ "reason": reason })),
-                ));
-                return;
-            }
-        };
+    let resolved = match super::mcp::resolve_acp_mcp_servers(&params.mcp_servers, actual_cwd) {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            let _ = tx.send(jsonrpc::error_response(
+                &id,
+                jsonrpc::INVALID_PARAMS,
+                "Invalid params",
+                Some(&json!({ "reason": reason })),
+            ));
+            return;
+        }
+    };
     if let Err(details) = super::mcp::acp_mcp_tool_names(&resolved) {
-        state.lock().await.session_new_in_flight = false;
         let _ = tx.send(super::internal_error(&id, &details));
         return;
     }
 
-    let acp_session_id = uuid::Uuid::new_v4().to_string();
-    let producer = UpdateProducer::new(acp_session_id.clone(), tx.clone());
+    let producer = UpdateProducer::new(acp_session_id.to_string(), tx.clone());
     // Neither picker fetch may fail the admission: discovery failures
     // catch to an empty list, a state fetch failure degrades to no
     // options.
@@ -1199,7 +1321,7 @@ async fn handle_session_new(
         models: tokio::sync::Mutex::new(models),
     });
     let mut hosted = HostedSession {
-        acp_session_id: acp_session_id.clone(),
+        acp_session_id: acp_session_id.to_string(),
         daemon_active_session_id: binding.active_session_id.clone(),
         producer,
         config,
@@ -1245,7 +1367,6 @@ async fn handle_session_new(
                 state,
             )
             .await;
-            state.lock().await.session_new_in_flight = false;
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
             return;
         }
@@ -1259,8 +1380,8 @@ async fn handle_session_new(
         "configOptions": *hosted.config.published.lock().await,
     });
     if let Some(requested) = params.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
-        let actual = options.actual_cwd.display().to_string();
-        if !super::same_cwd(Path::new(requested), &options.actual_cwd) {
+        let actual = actual_cwd.display().to_string();
+        if !super::same_cwd(Path::new(requested), actual_cwd) {
             result["_meta"] = meta::prime_agent_meta(&PrimeAgentSessionMeta {
                 cwd: Some(meta::PrimeAgentCwdMeta {
                     requested: requested.to_string(),
@@ -1277,7 +1398,6 @@ async fn handle_session_new(
     let producer = Arc::clone(&hosted.producer);
     let inherited_pause = {
         let mut guard = state.lock().await;
-        guard.session_new_in_flight = false;
         if let Some(pause_id) = guard.closed_input_pause_id.clone() {
             hosted.input_pause_id = Some(pause_id);
             hosted.input_pause_key = guard.closed_input_pause_key.clone();
@@ -1300,7 +1420,6 @@ async fn handle_session_new(
             .await;
             let mut guard = state.lock().await;
             guard.session = None;
-            guard.session_new_in_flight = false;
             drop(guard);
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
             return;
@@ -2408,37 +2527,29 @@ mod tests {
             client_owned: false,
             mcp_owner_id: "owner-1".to_string(),
         };
-        let options = DaemonAcpOptions {
-            socket_path: PathBuf::new(),
-            actual_cwd: PathBuf::from("/tmp"),
-            product_version: "test".to_string(),
-            create: DaemonCommand::GetConnectionState {
-                id: None,
-                active_session_id: "daemon-1".to_string(),
-                rest: Map::default(),
-            },
+        let host = SessionHost {
+            link: Arc::clone(&link),
+            state: Arc::clone(&state),
+            binding,
+            cwd: PathBuf::from("/tmp"),
+            consumer: tokio::spawn(std::future::pending::<()>()).abort_handle(),
         };
         let (tx, mut responses) = mpsc::unbounded_channel();
         handle_session_new(
             json!(1),
             json!({ "mcpServers": [{ "name": "example", "command": "echo", "args": [], "env": [] }] }),
-            &link, &state, &options, &binding, tx.clone(),
-        ).await;
+            "acp-1",
+            &host,
+            tx.clone(),
+        )
+        .await;
         assert!(responses.recv().await.unwrap().get("error").is_some());
         assert_eq!(state.lock().await.mcp_server_names, vec!["example"]);
 
-        handle_session_new(
-            json!(2),
-            json!({ "mcpServers": [] }),
-            &link,
-            &state,
-            &options,
-            &binding,
-            tx,
-        )
-        .await;
+        handle_session_new(json!(2), json!({ "mcpServers": [] }), "acp-1", &host, tx).await;
         assert!(responses.recv().await.unwrap().get("result").is_some());
         assert!(state.lock().await.mcp_server_names.is_empty());
+        drop(host);
         drop(link);
         let (replacements, installed) = worker.await.unwrap();
         assert_eq!(replacements, vec![vec!["example"], vec![], vec![]]);
