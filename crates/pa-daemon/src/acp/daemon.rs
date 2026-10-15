@@ -340,6 +340,17 @@ pub(crate) struct DaemonAcpState {
     pub(crate) closed_input_pause_key: Option<String>,
     pub(crate) mcp_server_names: Vec<String>,
     pub(crate) air: bool,
+    watch_ctx: Option<WatchCtx>,
+    /// A read-only mirror of a child's session: prompts are refused.
+    watching: bool,
+}
+
+/// What a host needs to open watch hosts for the children it observes.
+#[derive(Clone)]
+struct WatchCtx {
+    socket_path: PathBuf,
+    hosts: Hosts,
+    tx: producer::FrameSink,
 }
 
 /// Serve the daemon-attached ACP mode until stdin closes. The caller
@@ -571,8 +582,12 @@ fn spawn_event_consumer(
                     let mut refresh: Option<(Arc<HostedConfig>, Arc<UpdateProducer>, String)> =
                         None;
                     let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
+                    let mut new_child: Option<(WatchCtx, Value)> = None;
+                    let mut watching = false;
                     {
                         let mut guard = state.lock().await;
+                        let watch_ctx = guard.watch_ctx.clone();
+                        watching = guard.watching;
                         let Some(current) = guard.session.as_mut() else {
                             continue;
                         };
@@ -585,10 +600,30 @@ fn spawn_event_consumer(
                                 .and_then(|child| child.get("id"))
                                 .and_then(Value::as_str)
                             {
-                                current.observed_children.insert(id.to_string());
+                                if current.observed_children.insert(id.to_string()) {
+                                    new_child = watch_ctx.zip(event.get("child").cloned());
+                                }
                             }
                         }
                         let turn_id = current.producer.active_prompt_turn().await;
+                        if let Some((_, child)) = new_child.as_ref() {
+                            current
+                                .producer
+                                .publish_event(&subagent_spawned(child), turn_id, false)
+                                .await;
+                        }
+                        if watching && !current.mapping.streaming {
+                            if let Some(text) = unstreamed_assistant_text(&event) {
+                                let update = types::AcpSessionUpdate::AgentMessageChunk {
+                                    message_id: current.mapping.message_started(),
+                                    content: types::TextBlock::new(text),
+                                };
+                                current
+                                    .producer
+                                    .publish_event(&update, turn_id, false)
+                                    .await;
+                            }
+                        }
                         for update in wire_events::wire_updates(&event, &mut current.mapping) {
                             current
                                 .producer
@@ -606,16 +641,23 @@ fn spawn_event_consumer(
                                 turn_id,
                             ));
                         }
-                        if matches!(
-                            event.get("type").and_then(Value::as_str),
-                            Some("agent_end" | "auto_retry_start" | "auto_retry_end")
-                        ) {
+                        if !watching
+                            && matches!(
+                                event.get("type").and_then(Value::as_str),
+                                Some("agent_end" | "auto_retry_start" | "auto_retry_end")
+                            )
+                        {
                             refresh = Some((
                                 Arc::clone(&current.config),
                                 Arc::clone(&current.producer),
                                 current.daemon_active_session_id.clone(),
                             ));
                         }
+                    }
+                    if let Some((ctx, child)) = new_child {
+                        tokio::spawn(async move {
+                            let _ = open_watch_host(&ctx, &child).await;
+                        });
                     }
                     if let Some((producer, daemon_session_id, turn_id)) = usage_fetch {
                         let link = Arc::clone(&link);
@@ -853,6 +895,9 @@ async fn admit_prompt(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut guard = state.lock().await;
+    if guard.watching {
+        return Err(format!("Subagent sessions take no prompts: {session_id}"));
+    }
     let session_closing = guard.session_close_done.is_some();
     let Some(hosted) = guard
         .session
@@ -1178,10 +1223,12 @@ async fn open_host(
     cwd: PathBuf,
     create: DaemonCommand,
     air: bool,
+    watch_ctx: Option<WatchCtx>,
 ) -> anyhow::Result<SessionHost> {
     let link = Arc::new(DaemonLink::connect(socket_path).await?);
     let state = Arc::new(Mutex::new(DaemonAcpState {
         air,
+        watch_ctx,
         ..DaemonAcpState::default()
     }));
     let consumer = spawn_event_consumer(Arc::clone(&link), Arc::clone(&state));
@@ -1225,7 +1272,19 @@ async fn open_new_session(
         let create = (options.fresh_create)(&cwd, None);
         (cwd, create)
     };
-    let host = match open_host(&options.socket_path, cwd, create, air).await {
+    let host = match open_host(
+        &options.socket_path,
+        cwd,
+        create,
+        air,
+        air.then(|| WatchCtx {
+            socket_path: options.socket_path.clone(),
+            hosts: Arc::clone(hosts),
+            tx: tx.clone(),
+        }),
+    )
+    .await
+    {
         Ok(host) => host,
         Err(error) => {
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
@@ -1306,7 +1365,19 @@ async fn open_existing_session(
     };
     let path_for_history = path.clone();
     let create = (options.fresh_create)(&cwd, Some(path));
-    let host = match open_host(&options.socket_path, cwd, create, air).await {
+    let host = match open_host(
+        &options.socket_path,
+        cwd,
+        create,
+        air,
+        air.then(|| WatchCtx {
+            socket_path: options.socket_path.clone(),
+            hosts: Arc::clone(hosts),
+            tx: tx.clone(),
+        }),
+    )
+    .await
+    {
         Ok(host) => host,
         Err(error) => {
             let _ = tx.send(super::internal_error(&id, &error.to_string()));
@@ -2531,6 +2602,110 @@ async fn teardown(
         let _ = hosted.config.queue.lock().await;
         hosted.producer.close().await;
     }
+}
+
+/// The text of an assistant message that ended without any streamed delta.
+fn unstreamed_assistant_text(event: &Value) -> Option<String> {
+    let message = event.get("message")?;
+    (event.get("type")?.as_str()? == "message_end" && message.get("role")?.as_str()? == "assistant")
+        .then(|| message.get("content")?.as_str().map(str::to_string))
+        .flatten()
+        .filter(|text| !text.is_empty())
+}
+
+fn child_acp_id(child: &Value) -> String {
+    ["sessionId", "id"]
+        .iter()
+        .find_map(|key| child.get(key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn subagent_spawned(child: &Value) -> types::AcpSessionUpdate {
+    let text = |key: &str| child.get(key).and_then(Value::as_str).map(str::to_string);
+    types::AcpSessionUpdate::SubagentSpawned {
+        subagent_session_id: child_acp_id(child),
+        name: text("sessionName").unwrap_or_else(|| child_acp_id(child)),
+        task: text("label").unwrap_or_default(),
+        capabilities: json!({}),
+    }
+}
+
+/// Mirror one rlm child's daemon session as its own ACP session: attach
+/// only, so the child's events stream out under its acp id.
+async fn open_watch_host(ctx: &WatchCtx, child: &Value) -> anyhow::Result<()> {
+    let acp_id = child_acp_id(child);
+    let active = child
+        .get("activeSessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("child has no active session"))?
+        .to_string();
+    let link = Arc::new(DaemonLink::connect(&ctx.socket_path).await?);
+    let producer = UpdateProducer::new(acp_id.clone(), ctx.tx.clone());
+    producer.commit_session_new_response().await;
+    let hosted = HostedSession {
+        acp_session_id: acp_id.clone(),
+        daemon_active_session_id: active.clone(),
+        producer,
+        config: Arc::new(HostedConfig {
+            queue: tokio::sync::Mutex::new(()),
+            published: tokio::sync::Mutex::new(Vec::new()),
+            models: tokio::sync::Mutex::new(Vec::new()),
+        }),
+        cancelling: false,
+        stop_failure: None,
+        input_pause_key: None,
+        input_pause_id: None,
+        cancel_task: None,
+        turn: None,
+        assistant_stop_reason: None,
+        mapping: WireMappingState::default(),
+        observed_children: std::collections::HashSet::new(),
+        commands_task: None,
+        pending_terminal: None,
+    };
+    let state = Arc::new(Mutex::new(DaemonAcpState {
+        session: Some(hosted),
+        air: true,
+        watch_ctx: Some(ctx.clone()),
+        watching: true,
+        ..DaemonAcpState::default()
+    }));
+    let consumer = spawn_event_consumer(Arc::clone(&link), Arc::clone(&state));
+    let attached = link
+        .request(DaemonCommand::Attach {
+            id: None,
+            active_session_id: active.clone(),
+            client_id: None,
+            capabilities: None,
+            resume_cursor: None,
+            telemetry_disabled: None,
+            recovery_config: None,
+            env: None,
+            launch_env: None,
+            rest: Map::default(),
+        })
+        .await;
+    if !attached.as_ref().is_ok_and(|response| response.success) {
+        consumer.abort();
+        anyhow::bail!("watch attach failed");
+    }
+    ctx.hosts.lock().unwrap().insert(
+        acp_id,
+        SessionHost {
+            link,
+            state,
+            binding: DaemonBinding {
+                active_session_id: active,
+                durable_session_id: None,
+                client_owned: false,
+                mcp_owner_id: uuid::Uuid::new_v4().to_string(),
+            },
+            cwd: PathBuf::new(),
+            consumer,
+        },
+    );
+    Ok(())
 }
 
 fn merge_meta(result: &mut Value, extra: impl serde::Serialize) {

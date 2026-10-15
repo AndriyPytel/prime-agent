@@ -188,6 +188,22 @@ pub enum AcpSessionUpdate {
         #[serde(rename = "_meta")]
         meta: Value,
     },
+    /// An Air client's native subagent session appeared under this session.
+    #[serde(rename = "subagent_spawned")]
+    SubagentSpawned {
+        #[serde(rename = "subagentSessionId")]
+        subagent_session_id: String,
+        name: String,
+        task: String,
+        capabilities: Value,
+    },
+    /// A native subagent session changed state (`completed`, `failed`, `cancelled`).
+    #[serde(rename = "subagent_state_update")]
+    SubagentStateUpdate {
+        #[serde(rename = "subagentSessionId")]
+        subagent_session_id: String,
+        state: String,
+    },
     /// Context window occupancy after an assistant message or compaction.
     #[serde(rename = "usage_update")]
     UsageUpdate { used: u64, size: u64 },

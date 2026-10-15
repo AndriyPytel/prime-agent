@@ -44,7 +44,7 @@ impl WireMappingState {
         id
     }
 
-    fn message_started(&mut self) -> String {
+    pub(super) fn message_started(&mut self) -> String {
         self.active_assistant_message_id
             .clone()
             .unwrap_or_else(|| self.start_assistant_message())

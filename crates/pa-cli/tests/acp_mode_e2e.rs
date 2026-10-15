@@ -357,6 +357,61 @@ fn acp_air_client_gets_native_subagent_capability_and_others_do_not() {
     assert!(!response.to_string().contains("jetbrains"), "{response}");
 }
 
+fn air_spawn_lane(hold_ms: u64, kernel_python: &std::path::Path) -> (AcpChild, String) {
+    let parent = spawn_parent_script(spawn_cell());
+    let child_script = json!({ "responses": [ { "text": "kid done", "delayMs": hold_ms } ] });
+    let mut client = AcpChild::spawn_with_child_script(
+        &["--mode", "acp"],
+        &parent,
+        &child_script,
+        kernel_python,
+    );
+    let init = client.request("initialize", &air_initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    (client, session_id)
+}
+
+fn is_update(frame: &Value, session_id: &str, kind: &str) -> bool {
+    frame["params"]["sessionId"] == session_id && frame["params"]["update"]["sessionUpdate"] == kind
+}
+
+#[test]
+fn acp_air_child_streams_as_a_native_subagent_session() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut client, session_id) = air_spawn_lane(1_500, &kernel_python);
+    let _prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let spawned = client.wait_frame(TIMEOUT, |f| is_update(f, &session_id, "subagent_spawned"));
+    let child_id = spawned["params"]["update"]["subagentSessionId"]
+        .as_str()
+        .expect("child id")
+        .to_string();
+    assert_eq!(spawned["params"]["update"]["name"], "kid");
+    let _ = client.wait_frame(TIMEOUT, |f| f["params"]["sessionId"] == child_id.as_str());
+}
+
+#[test]
+fn acp_non_air_client_sees_no_subagent_frames() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut client, session_id, _) = spawn_lane(&["--mode", "acp"], 1_000, &kernel_python);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let (_, updates) = client.wait_response(prompt, TIMEOUT);
+    assert!(
+        updates.iter().all(|f| !f.to_string().contains("subagent_")),
+        "{updates:?}"
+    );
+}
+
 #[test]
 fn acp_second_initialize_is_served() {
     let script = json!({ "responses": ["unused"] });
