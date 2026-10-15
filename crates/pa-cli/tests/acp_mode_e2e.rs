@@ -218,6 +218,7 @@ fn daemon_attached_command(
     socket: &std::path::Path,
     args: &[&str],
 ) -> Command {
+    let home = &home.canonicalize().expect("canonical home");
     let mut command = Command::new(env!("CARGO_BIN_EXE_prime-agent"));
     command
         .args(args)
@@ -2637,4 +2638,66 @@ fn acp_session_id_is_the_saved_session_file_id() {
             .and_then(std::ffi::OsStr::to_str),
         Some(session_id.as_str())
     );
+}
+
+fn saved_session_with_one_turn() -> (AcpChild, String, std::path::PathBuf) {
+    let mut first = AcpChild::spawn(
+        &["--mode", "acp"],
+        &json!({ "engine": "faux", "responses": ["The Nile.", "Everest.", "K2."] }),
+    );
+    let session_id = initialize_and_new_session(&mut first);
+    assert_prompt_ends_turn(&mut first, &session_id, "Name a river.");
+    let file = std::path::PathBuf::from(
+        live_sessions(&first.socket)[0]["sessionFile"]
+            .as_str()
+            .expect("a saved session"),
+    );
+    first.close_stdin();
+    assert!(first.child.wait().expect("the ACP child exits").success());
+    (first, session_id, file)
+}
+
+fn next_process(first: &AcpChild) -> AcpChild {
+    let socket = first.socket.clone();
+    let child = daemon_attached_command(socket.parent().unwrap(), &socket, &["--mode", "acp"])
+        .spawn()
+        .expect("binary present");
+    AcpChild::wrap(child, None, socket)
+}
+
+fn session_cwd(first: &AcpChild) -> String {
+    first
+        .socket
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string()
+}
+
+fn replayed(updates: &[Value]) -> Vec<&str> {
+    updates
+        .iter()
+        .filter_map(|update| update["params"]["update"]["sessionUpdate"].as_str())
+        .filter(|kind| kind.ends_with("_message_chunk") || kind.ends_with("_thought_chunk"))
+        .collect()
+}
+
+#[test]
+fn acp_session_resume_reopens_a_saved_session_without_replay() {
+    let (first, session_id, file) = saved_session_with_one_turn();
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let resume = second.request(
+        "session/resume",
+        &json!({ "sessionId": session_id, "cwd": session_cwd(&first), "mcpServers": [] }),
+    );
+    let (response, updates) = second.wait_response(resume, TIMEOUT);
+    assert!(response["result"]["configOptions"].is_array(), "{response}");
+    assert!(replayed(&updates).is_empty(), "no replay: {updates:?}");
+    assert_prompt_ends_turn(&mut second, &session_id, "Name a mountain.");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("Name a river.") && saved.contains("Name a mountain."));
 }

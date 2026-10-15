@@ -412,6 +412,12 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
             }
             continue;
         }
+        if matches!(method, "session/resume" | "session/load" | "session/fork") {
+            if let Incoming::Request { id, method, params } = incoming {
+                open_existing_session(id, &method, params, &options, &hosts, &tx).await;
+            }
+            continue;
+        }
         let session_id = match &incoming {
             Incoming::Request { params, .. } | Incoming::Notification { params, .. } => params
                 .get("sessionId")
@@ -1213,6 +1219,62 @@ async fn open_new_session(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     host_session(id, &params, &acp_session_id, host, hosts, tx.clone()).await;
+}
+
+/// `session/resume`, `session/load` and `session/fork`: host a saved
+/// session under its durable id.
+async fn open_existing_session(
+    id: Value,
+    method: &str,
+    params: Value,
+    options: &DaemonAcpOptions,
+    hosts: &Hosts,
+    tx: &producer::FrameSink,
+) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if method != "session/fork" {
+        let hosted = hosts.lock().unwrap().get(&session_id).cloned();
+        if let Some(host) = hosted {
+            let config_options = match host.state.lock().await.session.as_ref() {
+                Some(session) => session.config.published.lock().await.clone(),
+                None => Vec::new(),
+            };
+            let _ = tx.send(jsonrpc::response(
+                &id,
+                &json!({ "sessionId": session_id, "configOptions": config_options }),
+            ));
+            return;
+        }
+    }
+    let requested_cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map_or_else(|| options.first_cwd.clone(), PathBuf::from);
+    let path = match (options.resolve_session)(&session_id, &requested_cwd) {
+        Ok(path) => path,
+        Err(message) => {
+            let _ = tx.send(super::internal_error(&id, &message));
+            return;
+        }
+    };
+    let cwd = pa_core::session::manager::read_session_header(&path)
+        .map(|header| PathBuf::from(header.cwd))
+        .filter(|cwd| !cwd.as_os_str().is_empty() && cwd.exists())
+        .unwrap_or(requested_cwd);
+    let create = (options.fresh_create)(&cwd, Some(path));
+    let host = match open_host(&options.socket_path, cwd, create).await {
+        Ok(host) => host,
+        Err(error) => {
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+            return;
+        }
+    };
+    host_session(id, &params, &session_id, host, hosts, tx.clone()).await;
 }
 
 /// Register the host, run the admission, and drop the host again when
