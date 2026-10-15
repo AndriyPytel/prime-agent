@@ -563,6 +563,15 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         });
     }
     while teardowns.join_next().await.is_some() {}
+    let hosts: Vec<SessionHost> = hosts
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(_, host)| host)
+        .collect();
+    for host in hosts {
+        host.consumer.abort();
+    }
     drop(tx);
     let _ = writer.await;
     Ok(0)
@@ -1735,7 +1744,7 @@ async fn handle_session_new(
     {
         let mut guard = state.lock().await;
         if let Some(current) = guard.session.as_mut() {
-            for child in children {
+            for child in &children {
                 let id = child.get("id").and_then(Value::as_str).unwrap_or_default();
                 if !current.observed_children.insert(id.to_string()) {
                     continue;
@@ -1753,7 +1762,36 @@ async fn handle_session_new(
     for update in wire_events::replay_updates(history) {
         producer.replay(&update);
     }
+    let watch_ctx = state.lock().await.watch_ctx.clone();
+    let mut live_children = Vec::new();
+    if watch_ctx.is_some() {
+        for child in &children {
+            producer.replay(&subagent_spawned(child));
+            let state = child_terminal_state(child).unwrap_or(
+                if outstanding_subagents(std::slice::from_ref(child)) > 0 {
+                    "running"
+                } else {
+                    "disconnected"
+                },
+            );
+            producer.replay(&types::AcpSessionUpdate::SubagentStateUpdate {
+                subagent_session_id: child_acp_id(child),
+                state: state.to_string(),
+            });
+            if state == "running" {
+                live_children.push(child.clone());
+            }
+        }
+    }
     let _ = tx.send(jsonrpc::response(&id, &result));
+    if let Some(ctx) = watch_ctx {
+        for child in live_children {
+            let (ctx, parent) = (ctx.clone(), acp_session_id.to_string());
+            tokio::spawn(async move {
+                let _ = open_watch_host(&ctx, &parent, &child).await;
+            });
+        }
+    }
     {
         let mut guard = state.lock().await;
         if let Some(current) = guard.session.as_mut() {
@@ -2842,7 +2880,6 @@ mod tests {
             assistant_stop_reason: None,
             mapping: WireMappingState::default(),
             observed_children: std::collections::HashSet::new(),
-            settled_children: std::collections::HashSet::new(),
             settled_children: std::collections::HashSet::new(),
             commands_task: None,
             pending_terminal: None,

@@ -2839,6 +2839,42 @@ fn acp_session_load_replays_history_before_the_response() {
     assert!(appended.contains("Name a river.") && appended.contains("Name a mountain."));
 }
 
+#[test]
+fn acp_air_load_announces_the_known_children_before_the_response() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut first, session_id) = air_spawn_lane(500, &kernel_python);
+    let prompt = first.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let _ = first.wait_response(prompt, TIMEOUT);
+    first.close_stdin();
+    assert!(first.child.wait().expect("the ACP child exits").success());
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &air_initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let load = second.request(
+        "session/load",
+        &json!({ "sessionId": session_id, "cwd": session_cwd(&first), "mcpServers": [] }),
+    );
+    let (_, updates) = second.wait_response(load, TIMEOUT);
+    let kinds: Vec<&str> = updates
+        .iter()
+        .filter_map(|update| update["params"]["update"]["sessionUpdate"].as_str())
+        .collect();
+    let spawned = kinds
+        .iter()
+        .position(|k| *k == "subagent_spawned")
+        .expect("spawned");
+    let state = kinds
+        .iter()
+        .position(|k| *k == "subagent_state_update")
+        .expect("state");
+    assert!(spawned < state, "{kinds:?}");
+}
+
 fn fork_params(first: &AcpChild, session_id: &str, meta: &Value) -> Value {
     json!({ "sessionId": session_id, "cwd": session_cwd(first), "mcpServers": [], "_meta": meta })
 }
