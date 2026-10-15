@@ -3,7 +3,7 @@
 use super::{default_rlm_extra_uv_args, BootstrapPythonSkill, BootstrapVersion, Path};
 
 /// Schema of `.bootstrap-version`; a mismatch rebuilds the venv.
-pub(super) const BOOTSTRAP_SCHEMA: u64 = 9;
+pub(super) const BOOTSTRAP_SCHEMA: u64 = 10;
 pub(super) const STATE_SNAPSHOT_REQUIREMENT: &str = "dill";
 const BOOTSTRAP_VERSION_FILE: &str = ".bootstrap-version";
 pub(super) fn read_bootstrap_version(venv: &Path) -> Option<BootstrapVersion> {
@@ -19,10 +19,10 @@ fn extra_uv_args_match(a: Option<&[String]>, b: &[&str]) -> bool {
     }
 }
 
-/// Identity of one recorded skill: the install root is the package path, and
-/// the editable install follows that path.
+/// Identity of one recorded skill: a venv holds one distribution per import name, so a skill
+/// requested from another package path replaces the record rather than sitting beside it.
 pub(super) fn bootstrap_skill_key(skill: &BootstrapPythonSkill) -> String {
-    format!("{}\u{0}{}", skill.import_name, skill.package_path)
+    skill.import_name.clone()
 }
 
 /// True when the recorded installs cover every current skill at the same path with the same

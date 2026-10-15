@@ -1065,3 +1065,57 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         .collect::<Vec<_>>();
     assert_eq!(recorded, vec!["edit"], "only the healthy skill is recorded");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skill_sync_reinstalls_a_skill_recorded_at_another_path() {
+    // One venv holds one `edit`: a record at another checkout must not
+    // satisfy this one, and the reinstall replaces that record.
+    let dir = tempfile::tempdir().unwrap();
+    let uv = fake_uv(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            dir.path().join("uv.log").display()
+        ),
+    );
+    let venv = dir.path().join("venv");
+    std::fs::create_dir_all(&venv).unwrap();
+    let worktree = dir.path().join("worktree/edit");
+    let installed = dir.path().join("installed/edit");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&installed).unwrap();
+    let installed = installed.to_str().unwrap();
+    write_bootstrap_version(
+        &venv,
+        "sha256:rt",
+        &[
+            skill("edit", installed, "h1"),
+            skill("edit", worktree.to_str().unwrap(), "h1"),
+        ],
+    )
+    .unwrap();
+    sync_python_skills(
+        uv.to_str().unwrap(),
+        &venv,
+        dir.path().join("python").as_path(),
+        "sha256:rt",
+        &[skill("edit", installed, "h1")],
+        &EnsureKernelPythonOptions::default(),
+    )
+    .await
+    .unwrap();
+    let calls = uv_invocations(dir.path());
+    assert!(
+        calls.len() == 1 && calls[0].contains(installed),
+        "the requested path is installed: {calls:?}"
+    );
+    let version = read_bootstrap_version(&venv).expect("version written");
+    let recorded = version
+        .python_skills
+        .unwrap()
+        .into_iter()
+        .map(|s| s.package_path)
+        .collect::<Vec<_>>();
+    assert_eq!(recorded, vec![installed.to_string()]);
+}
