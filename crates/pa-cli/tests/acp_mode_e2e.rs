@@ -2618,3 +2618,23 @@ fn acp_one_connection_hosts_two_independent_sessions() {
         assert_eq!(chunk["params"]["sessionId"], json!(id));
     }
 }
+
+#[test]
+fn acp_session_id_is_the_saved_session_file_id() {
+    let mut client = AcpChild::spawn(
+        &["--mode", "acp"],
+        &json!({ "engine": "faux", "responses": ["The Nile."] }),
+    );
+    let socket = client.socket.clone();
+    let session_id = initialize_and_new_session(&mut client);
+    let sessions = live_sessions(&socket);
+    let file = sessions[0]["sessionFile"]
+        .as_str()
+        .expect("a saved session");
+    assert_eq!(
+        std::path::Path::new(file)
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str),
+        Some(session_id.as_str())
+    );
+}

@@ -272,6 +272,8 @@ type Hosts = Arc<std::sync::Mutex<HashMap<String, SessionHost>>>;
 #[derive(Clone)]
 struct DaemonBinding {
     active_session_id: String,
+    /// The saved session's id (its file stem); `None` without a file.
+    durable_session_id: Option<String>,
     /// The create's `client_owned` lifecycle (`--no-session`): the
     /// session ends with the connection.
     client_owned: bool,
@@ -680,7 +682,19 @@ async fn bind_daemon_session(
     if !created.success {
         anyhow::bail!(created.error.unwrap_or_else(|| "unknown error".to_string()));
     }
+    let summary = created.data.as_ref();
+    let durable_session_id = summary
+        .filter(|summary| {
+            summary
+                .get("sessionFile")
+                .and_then(Value::as_str)
+                .is_some_and(|file| !file.is_empty())
+        })
+        .and_then(|summary| summary.get("sessionId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let binding = DaemonBinding {
+        durable_session_id,
         active_session_id: created
             .data
             .as_ref()
@@ -1193,7 +1207,11 @@ async fn open_new_session(
             return;
         }
     };
-    let acp_session_id = uuid::Uuid::new_v4().to_string();
+    let acp_session_id = host
+        .binding
+        .durable_session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     host_session(id, &params, &acp_session_id, host, hosts, tx.clone()).await;
 }
 
@@ -2524,6 +2542,7 @@ mod tests {
         let state = Arc::new(Mutex::new(state(None)));
         let binding = DaemonBinding {
             active_session_id: "daemon-1".to_string(),
+            durable_session_id: None,
             client_owned: false,
             mcp_owner_id: "owner-1".to_string(),
         };
