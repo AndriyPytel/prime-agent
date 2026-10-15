@@ -1262,10 +1262,28 @@ async fn open_existing_session(
             return;
         }
     };
-    let cwd = pa_core::session::manager::read_session_header(&path)
-        .map(|header| PathBuf::from(header.cwd))
-        .filter(|cwd| !cwd.as_os_str().is_empty() && cwd.exists())
-        .unwrap_or(requested_cwd);
+    let (path, session_id, cwd) = if method == "session/fork" {
+        match fork_session_file(&path, &params, &requested_cwd, &options.session_dir) {
+            Ok(forked) => {
+                let forked_id = forked
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or_default()
+                    .to_string();
+                (forked, forked_id, requested_cwd)
+            }
+            Err(message) => {
+                let _ = tx.send(super::internal_error(&id, &message));
+                return;
+            }
+        }
+    } else {
+        let cwd = pa_core::session::manager::read_session_header(&path)
+            .map(|header| PathBuf::from(header.cwd))
+            .filter(|cwd| !cwd.as_os_str().is_empty() && cwd.exists())
+            .unwrap_or(requested_cwd);
+        (path, session_id, cwd)
+    };
     let path_for_history = path.clone();
     let create = (options.fresh_create)(&cwd, Some(path));
     let host = match open_host(&options.socket_path, cwd, create).await {
@@ -1281,6 +1299,63 @@ async fn open_existing_session(
         Vec::new()
     };
     host_session(id, &params, &session_id, host, &history, hosts, tx.clone()).await;
+}
+
+/// Copy the source session into a new file for `cwd`. The JetBrains Air
+/// fork point keeps the user turn it names and everything before it.
+fn fork_session_file(
+    source: &Path,
+    params: &Value,
+    cwd: &Path,
+    session_dir: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(leaf) = air_fork_leaf(source, params) {
+        let store = crate::session_store::SessionFile::open(source)
+            .map_err(|error| format!("{error:#}"))?;
+        let mut forked = store
+            .create_branched_file(&leaf, session_dir)
+            .map_err(|error| format!("{error:#}"))?;
+        forked.header.cwd = cwd.display().to_string();
+        forked.rewrite().map_err(|error| format!("{error:#}"))?;
+        return Ok(forked.path.clone());
+    }
+    let forked = pa_core::session::manager::SessionManager::fork_from(source, cwd, session_dir)?;
+    forked
+        .get_session_file()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "the fork wrote no session file".to_string())
+}
+
+/// The last entry of the user turn the Air fork point names, or `None`
+/// for a full copy (no fork point, an unknown id, or the last turn).
+fn air_fork_leaf(source: &Path, params: &Value) -> Option<String> {
+    let fork = params.pointer("/_meta/jetbrains/air/fork")?;
+    if fork.get("version").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let raw = fork.get("messageId").and_then(Value::as_str)?;
+    let message_id = match raw.rsplit_once(":segment:") {
+        Some((head, tail)) if tail.bytes().all(|byte| byte.is_ascii_digit()) => head,
+        _ => raw,
+    };
+    let store = crate::session_store::SessionFile::open(source).ok()?;
+    let branch = store.branch();
+    let is_user = |entry: &crate::session_store::SessionEntry| {
+        entry.type_ == "message"
+            && entry
+                .fields
+                .pointer("/message/role")
+                .and_then(Value::as_str)
+                == Some("user")
+    };
+    let start = branch
+        .iter()
+        .position(|entry| entry.id == message_id && is_user(entry))?;
+    let next = branch[start + 1..]
+        .iter()
+        .position(|entry| is_user(entry))
+        .map(|offset| start + 1 + offset)?;
+    Some(branch[next - 1].id.clone())
 }
 
 /// The stored message rows of the session file's current branch, with

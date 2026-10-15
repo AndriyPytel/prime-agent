@@ -2641,12 +2641,18 @@ fn acp_session_id_is_the_saved_session_file_id() {
 }
 
 fn saved_session_with_one_turn() -> (AcpChild, String, std::path::PathBuf) {
+    saved_session_with_turns(&["Name a river."])
+}
+
+fn saved_session_with_turns(turns: &[&str]) -> (AcpChild, String, std::path::PathBuf) {
     let mut first = AcpChild::spawn(
         &["--mode", "acp"],
         &json!({ "engine": "faux", "responses": ["The Nile.", "Everest.", "K2."] }),
     );
     let session_id = initialize_and_new_session(&mut first);
-    assert_prompt_ends_turn(&mut first, &session_id, "Name a river.");
+    for turn in turns {
+        assert_prompt_ends_turn(&mut first, &session_id, turn);
+    }
     let file = std::path::PathBuf::from(
         live_sessions(&first.socket)[0]["sessionFile"]
             .as_str()
@@ -2731,4 +2737,66 @@ fn acp_session_load_replays_history_before_the_response() {
     assert_prompt_ends_turn(&mut second, &session_id, "Name a mountain.");
     let appended = std::fs::read_to_string(&file).unwrap();
     assert!(appended.contains("Name a river.") && appended.contains("Name a mountain."));
+}
+
+fn fork_params(first: &AcpChild, session_id: &str, meta: Value) -> Value {
+    json!({ "sessionId": session_id, "cwd": session_cwd(first), "mcpServers": [], "_meta": meta })
+}
+
+fn fork_session(second: &mut AcpChild, params: &Value) -> (String, std::path::PathBuf) {
+    let fork = second.request("session/fork", params);
+    let (response, updates) = second.wait_response(fork, TIMEOUT);
+    assert!(replayed(&updates).is_empty(), "no replay: {updates:?}");
+    let forked_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/fork succeeds: {response}"))
+        .to_string();
+    let sessions = live_sessions(&second.socket);
+    let file = sessions
+        .iter()
+        .filter_map(|session| session["sessionFile"].as_str())
+        .find(|file| file.contains(&forked_id))
+        .unwrap_or_else(|| panic!("the fork is hosted: {sessions:?}"));
+    (forked_id, std::path::PathBuf::from(file))
+}
+
+#[test]
+fn acp_session_fork_copies_the_history_and_leaves_the_source_alone() {
+    let (first, session_id, file) = saved_session_with_one_turn();
+    let before = std::fs::read_to_string(&file).unwrap();
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let (forked_id, forked_file) =
+        fork_session(&mut second, &fork_params(&first, &session_id, json!({})));
+    assert_ne!(forked_id, session_id);
+    assert_ne!(forked_file, file);
+    assert!(std::fs::read_to_string(&forked_file)
+        .unwrap()
+        .contains("Name a river."));
+    assert_prompt_ends_turn(&mut second, &forked_id, "Name a mountain.");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+}
+
+#[test]
+fn acp_session_fork_at_an_air_fork_point_keeps_that_turn_only() {
+    let (first, session_id, file) = saved_session_with_turns(&["Name a river.", "Name a lake."]);
+    let first_user_id = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| entry["message"]["role"] == "user")
+        .map(|entry| entry["id"].as_str().unwrap().to_string())
+        .expect("a stored user entry");
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let meta = json!({ "jetbrains": { "air": { "fork": {
+        "version": 1,
+        "messageId": format!("{first_user_id}:segment:0"),
+    } } } });
+    let (_, forked_file) = fork_session(&mut second, &fork_params(&first, &session_id, meta));
+    let forked = std::fs::read_to_string(&forked_file).unwrap();
+    assert!(forked.contains("Name a river.") && forked.contains("The Nile."));
+    assert!(!forked.contains("Name a lake."), "{forked}");
 }
