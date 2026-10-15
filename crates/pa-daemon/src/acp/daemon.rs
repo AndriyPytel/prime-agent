@@ -475,6 +475,16 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         // Prompt admission and cancel marking run here, in frame order (TS
         // runs a request's synchronous prefix before the next frame's
         // handler).
+        if method == "session/close" && host.state.lock().await.watching {
+            hosts.lock().unwrap().remove(&session_id);
+            drop_watch_hosts(&hosts, &session_id).await;
+            teardown(&host.link, &host.state, &host.binding).await;
+            host.consumer.abort();
+            if let Incoming::Request { id, .. } = &incoming {
+                let _ = tx.send(jsonrpc::response(id, &json!({})));
+            }
+            continue;
+        }
         let SessionHost {
             link,
             state,

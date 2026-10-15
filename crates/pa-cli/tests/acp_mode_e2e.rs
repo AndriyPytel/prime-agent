@@ -404,6 +404,40 @@ fn acp_air_child_streams_as_a_native_subagent_session() {
 }
 
 #[test]
+fn acp_air_closing_a_child_tab_detaches_without_ending_the_child() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let (mut client, session_id) = air_spawn_lane(4_000, &kernel_python);
+    let _prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let spawned = client.wait_frame(TIMEOUT, |f| is_update(f, &session_id, "subagent_spawned"));
+    let child_id = spawned["params"]["update"]["subagentSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let close = client.request("session/close", &json!({ "sessionId": child_id }));
+        let (response, _) = client.wait_response(close, TIMEOUT);
+        if response["result"] == json!({}) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child tab never closed: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let done = client.wait_frame(TIMEOUT, |f| {
+        is_update(f, &session_id, "subagent_state_update")
+    });
+    assert_eq!(done["params"]["update"]["state"], "completed", "{done}");
+}
+
+#[test]
 fn acp_non_air_client_sees_no_subagent_frames() {
     let Some(kernel_python) = kernel_python() else {
         return;
