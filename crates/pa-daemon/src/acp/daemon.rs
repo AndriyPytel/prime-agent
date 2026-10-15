@@ -344,6 +344,7 @@ pub(crate) struct DaemonAcpState {
     watch_ctx: Option<WatchCtx>,
     /// A read-only mirror of a child's session: prompts are refused.
     watching: bool,
+    watch_parent: Option<String>,
 }
 
 /// What a host needs to open watch hosts for the children it observes.
@@ -521,6 +522,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                     .await;
                     if state.lock().await.session.is_none() {
                         hosts.lock().unwrap().remove(&session_id);
+                        drop_watch_hosts(&hosts, &session_id).await;
                         teardown(&link, &state, &binding).await;
                         host.consumer.abort();
                     }
@@ -584,6 +586,7 @@ fn spawn_event_consumer(
                         None;
                     let mut usage_fetch: Option<(Arc<UpdateProducer>, String, u64)> = None;
                     let mut new_child: Option<(WatchCtx, Value)> = None;
+                    let mut parent_acp_id = String::new();
                     let mut settled: Option<(WatchCtx, Arc<UpdateProducer>, String, &'static str)> =
                         None;
                     {
@@ -594,6 +597,7 @@ fn spawn_event_consumer(
                         let Some(current) = guard.session.as_mut() else {
                             continue;
                         };
+                        parent_acp_id.clone_from(&current.acp_session_id);
                         if let Some(stop) = wire_events::assistant_stop(&event) {
                             current.assistant_stop_reason = stop.stop_reason;
                         }
@@ -678,8 +682,9 @@ fn spawn_event_consumer(
                         });
                     }
                     if let Some((ctx, child)) = new_child {
+                        let parent_acp_id = parent_acp_id.clone();
                         tokio::spawn(async move {
-                            let _ = open_watch_host(&ctx, &child).await;
+                            let _ = open_watch_host(&ctx, &parent_acp_id, &child).await;
                         });
                     }
                     if let Some((producer, daemon_session_id, turn_id)) = usage_fetch {
@@ -2587,6 +2592,16 @@ async fn teardown(
     state: &Arc<Mutex<DaemonAcpState>>,
     binding: &DaemonBinding,
 ) {
+    if state.lock().await.watching {
+        let _ = link
+            .request(DaemonCommand::Detach {
+                id: None,
+                active_session_id: Some(binding.active_session_id.clone()),
+                rest: Map::default(),
+            })
+            .await;
+        return;
+    }
     let hosted = state.lock().await.session.take();
     if let Some(hosted) = hosted.as_ref() {
         if let Some(turn) = hosted.turn.as_ref() {
@@ -2635,6 +2650,27 @@ fn unstreamed_assistant_text(event: &Value) -> Option<String> {
         .then(|| message.get("content")?.as_str().map(str::to_string))
         .flatten()
         .filter(|text| !text.is_empty())
+}
+
+/// Detach and drop the watch hosts under `parent_id`, nested ones included.
+async fn drop_watch_hosts(hosts: &Hosts, parent_id: &str) {
+    let mut parents = vec![parent_id.to_string()];
+    while let Some(parent) = parents.pop() {
+        let mut found = Vec::new();
+        for (id, host) in hosts.lock().unwrap().iter() {
+            if let Ok(guard) = host.state.try_lock() {
+                if guard.watch_parent.as_deref() == Some(parent.as_str()) {
+                    found.push((id.clone(), host.clone()));
+                }
+            }
+        }
+        for (id, host) in found {
+            hosts.lock().unwrap().remove(&id);
+            teardown(&host.link, &host.state, &host.binding).await;
+            host.consumer.abort();
+            parents.push(id);
+        }
+    }
 }
 
 fn child_terminal_state(child: &Value) -> Option<&'static str> {
@@ -2697,7 +2733,7 @@ fn subagent_spawned(child: &Value) -> types::AcpSessionUpdate {
 
 /// Mirror one rlm child's daemon session as its own ACP session: attach
 /// only, so the child's events stream out under its acp id.
-async fn open_watch_host(ctx: &WatchCtx, child: &Value) -> anyhow::Result<()> {
+async fn open_watch_host(ctx: &WatchCtx, parent_id: &str, child: &Value) -> anyhow::Result<()> {
     let acp_id = child_acp_id(child);
     let active = child
         .get("activeSessionId")
@@ -2734,6 +2770,7 @@ async fn open_watch_host(ctx: &WatchCtx, child: &Value) -> anyhow::Result<()> {
         air: true,
         watch_ctx: Some(ctx.clone()),
         watching: true,
+        watch_parent: Some(parent_id.to_string()),
         ..DaemonAcpState::default()
     }));
     let consumer = spawn_event_consumer(Arc::clone(&link), Arc::clone(&state));
