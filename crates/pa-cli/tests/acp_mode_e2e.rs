@@ -428,6 +428,13 @@ fn acp_air_turn_stays_open_until_its_children_settle() {
         .find(|f| is_update(f, &session_id, "subagent_state_update"))
         .expect("the kid settles inside the open turn");
     assert_eq!(done["params"]["update"]["state"], "completed");
+    assert!(
+        updates
+            .iter()
+            .any(|f| is_update(f, &session_id, "agent_message_chunk")
+                && f["params"]["update"]["_meta"]["jetbrains"]["air"]["phase"] == "final_answer"),
+        "the answer is marked final so Air shows it while the turn stays open"
+    );
     assert!(!updates
         .iter()
         .any(|f| is_update(f, &session_id, "async_task_spawned")));

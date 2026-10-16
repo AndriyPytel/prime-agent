@@ -273,6 +273,7 @@ mod tests {
         AcpSessionUpdate::AgentMessageChunk {
             message_id: "m".into(),
             content: super::super::types::TextBlock::new("x"),
+            meta: None,
         }
     }
 

@@ -31,6 +31,9 @@ pub struct WireMappingState {
     ipython_output: HashMap<String, String>,
     last_child_info: HashMap<String, String>,
     pub streaming: bool,
+    /// Air folds an open turn's text into its working group unless the
+    /// message is marked as the final answer.
+    pub air: bool,
 }
 
 impl WireMappingState {
@@ -73,6 +76,25 @@ pub fn assistant_stop(event: &Value) -> Option<AssistantStop> {
             .get("stopReason")
             .and_then(|value| pa_types::ai::StopReason::deserialize(value).ok()),
     })
+}
+
+/// An assistant message that stopped on its own and carries visible text.
+fn is_final_answer(message: &Value) -> bool {
+    matches!(
+        message.get("stopReason").and_then(Value::as_str),
+        Some("stop" | "length")
+    ) && message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            })
+        })
 }
 
 /// The ACP updates that replay stored `(entry id, message)` rows for
@@ -120,6 +142,7 @@ pub fn replay_updates(messages: &[(String, Value)]) -> Vec<AcpSessionUpdate> {
                                 updates.push(AcpSessionUpdate::AgentMessageChunk {
                                     message_id: entry_id.clone(),
                                     content: TextBlock::new(text),
+                                    meta: None,
                                 });
                             }
                         }
@@ -219,6 +242,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 Some("text_delta") => vec![AcpSessionUpdate::AgentMessageChunk {
                     message_id,
                     content: TextBlock::new(delta),
+                    meta: None,
                 }],
                 _ => Vec::new(),
             }
@@ -230,8 +254,19 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 .and_then(Value::as_str)
                 == Some("assistant")
             {
-                state.active_assistant_message_id = None;
+                let message_id = state.active_assistant_message_id.take();
                 state.streaming = false;
+                if let (true, Some(message_id)) = (state.air, message_id) {
+                    if is_final_answer(&event["message"]) {
+                        return vec![AcpSessionUpdate::AgentMessageChunk {
+                            message_id,
+                            content: TextBlock::new(""),
+                            meta: Some(
+                                json!({ "jetbrains": { "air": { "phase": "final_answer" } } }),
+                            ),
+                        }];
+                    }
+                }
             }
             Vec::new()
         }
@@ -1335,6 +1370,39 @@ mod tests {
             &mut state,
         );
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn air_marks_a_text_answer_that_ends_without_tool_calls_as_final() {
+        let end = |stop: &str, text: &str| {
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": stop,
+                    "content": [{ "type": "text", "text": text }],
+                },
+            })
+        };
+        let start = json!({ "type": "message_start", "message": { "role": "assistant" } });
+        let mut air = WireMappingState {
+            air: true,
+            ..WireMappingState::default()
+        };
+        wire_updates(&start, &mut air);
+        let updates = wire_updates(&end("stop", "answer"), &mut air);
+        let chunk = updates[0].to_bare_value();
+        assert_eq!(chunk["messageId"], "prime-agent-assistant-1");
+        assert_eq!(chunk["content"]["text"], "");
+        assert_eq!(chunk["_meta"]["jetbrains"]["air"]["phase"], "final_answer");
+        wire_updates(&start, &mut air);
+        assert!(wire_updates(&end("toolUse", "checking"), &mut air).is_empty());
+        wire_updates(&start, &mut air);
+        assert!(wire_updates(&end("stop", ""), &mut air).is_empty());
+
+        let mut plain = WireMappingState::default();
+        wire_updates(&start, &mut plain);
+        assert!(wire_updates(&end("stop", "answer"), &mut plain).is_empty());
     }
 
     #[test]

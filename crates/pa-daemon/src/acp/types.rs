@@ -149,6 +149,8 @@ pub enum AcpSessionUpdate {
         #[serde(rename = "messageId")]
         message_id: String,
         content: TextBlock,
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// A streaming chunk of the assistant's reasoning.
     #[serde(rename = "agent_thought_chunk")]
@@ -589,6 +591,7 @@ mod tests {
         let chunk = AcpSessionUpdate::AgentMessageChunk {
             message_id: "m1".into(),
             content: TextBlock::new("hi"),
+            meta: None,
         };
         assert_eq!(
             chunk.to_bare_value()["sessionUpdate"],

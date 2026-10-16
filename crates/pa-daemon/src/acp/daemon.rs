@@ -686,6 +686,7 @@ fn spawn_event_consumer(
                                 let update = types::AcpSessionUpdate::AgentMessageChunk {
                                     message_id: current.mapping.message_started(),
                                     content: types::TextBlock::new(text),
+                                    meta: None,
                                 };
                                 current
                                     .producer
@@ -1691,6 +1692,7 @@ async fn handle_session_new(
         commands_task: None,
         pending_terminal: None,
     };
+    hosted.mapping.air = state.lock().await.air;
     // The ACP MCP servers ride the wire command, not a local manager.
     let replace_skipped = resolved.is_empty() && state.lock().await.mcp_server_names.is_empty();
     if !replace_skipped {
