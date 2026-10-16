@@ -483,7 +483,14 @@ pub fn initialize_result(product_version: &str, air: bool) -> InitializeResult {
             title: "Prime Agent".to_string(),
             version: product_version.to_string(),
         },
-        meta: super::meta::prime_agent_meta(&super::meta::PrimeAgentSessionMeta::default()),
+        meta: {
+            let mut meta =
+                super::meta::prime_agent_meta(&super::meta::PrimeAgentSessionMeta::default());
+            if air {
+                meta["steering"] = serde_json::json!({ "supported": true });
+            }
+            meta
+        },
     }
 }
 

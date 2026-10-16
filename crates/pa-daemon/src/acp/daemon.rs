@@ -1282,6 +1282,9 @@ async fn handle_incoming(
         ("session/set_config_option", Some(host)) => {
             handle_set_config_option(id, params, &host.link, &host.state, tx).await;
         }
+        ("_session/steering", Some(host)) => {
+            let _ = tx.send(handle_session_steering(&id, &params, &host.link, &host.state).await);
+        }
         (other, _) => {
             let _ = tx.send(jsonrpc::error_response(
                 &id,
@@ -1923,6 +1926,77 @@ async fn handle_session_prompt(
     let _ = tx.send(reply);
 }
 
+/// Air's `_session/steering`: a message sent while a prompt turn is open
+/// reaches the agent at once, steering a running turn or starting one, and
+/// its events stream into the open turn.
+async fn handle_session_steering(
+    id: &Value,
+    params: &Value,
+    link: &Arc<DaemonLink>,
+    state: &Arc<Mutex<DaemonAcpState>>,
+) -> Value {
+    let params = types::PromptParams::parse(params);
+    let admitted = match types::AdmittedPrompt::parse(&params.prompt) {
+        Ok(admitted) => admitted,
+        Err(error) => return prompt_block_error(id, &error),
+    };
+    let active_session_id = {
+        let guard = state.lock().await;
+        match guard.session.as_ref() {
+            Some(hosted)
+                if hosted.acp_session_id == params.session_id
+                    && hosted.turn.as_ref().is_some_and(|turn| !turn.cancelled) =>
+            {
+                hosted.daemon_active_session_id.clone()
+            }
+            _ => {
+                return super::internal_error(
+                    id,
+                    &format!("No open prompt turn to steer: {}", params.session_id),
+                )
+            }
+        }
+    };
+    let steer = DaemonCommand::Prompt {
+        id: None,
+        active_session_id,
+        message: admitted.text,
+        input: pa_types::daemon::PromptInput {
+            content: None,
+            images: (!admitted.images.is_empty()).then(|| {
+                json!(admitted
+                    .images
+                    .into_iter()
+                    .map(|image| json!({ "type": "image", "data": image.data, "mimeType": image.mime_type }))
+                    .collect::<Vec<_>>())
+            }),
+            streaming_behavior: Some(pa_types::daemon::StreamingBehavior::Steer),
+            queue_if_busy: Some(true),
+            expand_prompt_templates: None,
+            source: None,
+            agent_message_id: None,
+            custom_message: None,
+            queue_key: None,
+            prefix_messages: None,
+            admission_id: None,
+            rlm_notice_nonce: None,
+        },
+        rest: Map::default(),
+    };
+    match link.request(steer).await {
+        Ok(response) if response.success => {
+            jsonrpc::response(id, &json!({ "outcome": "injected" }))
+        }
+        Ok(response) => super::internal_error(
+            id,
+            &response
+                .error
+                .unwrap_or_else(|| "steering refused".to_string()),
+        ),
+        Err(error) => super::internal_error(id, &error.to_string()),
+    }
+}
+
 /// Release this prompt's turn slot, after its stop sequence if it was
 /// cancelled. A slot holding another prompt's turn (close + new while
 /// this prompt ran) is left alone.
@@ -2180,7 +2254,16 @@ async fn prompt_turn(
     {
         hosted.pending_terminal = Some(settle.abort_handle());
     }
-    let settled_status = match tokio::time::timeout(PROMPT_SETTLE_GRACE, &mut settle).await {
+    // Air disconnects every native subagent when the prompt answers, so an Air
+    // turn stays open until the family is quiet; a user message meanwhile
+    // arrives as `_session/steering`.
+    let hold_for_family = state.lock().await.air;
+    let settle_wait = if hold_for_family {
+        Ok((&mut settle).await)
+    } else {
+        tokio::time::timeout(PROMPT_SETTLE_GRACE, &mut settle).await
+    };
+    let settled_status = match settle_wait {
         Err(_) => None,
         Ok(joined) => {
             if let Some(hosted) = state.lock().await.session.as_mut() {
