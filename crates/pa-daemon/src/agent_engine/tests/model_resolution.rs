@@ -1217,3 +1217,81 @@ fn a_model_switch_keeps_the_agent_slot_in_sync_with_the_reported_level() {
         "the agent slot re-syncs to the restored level"
     );
 }
+
+/// A long-lived session follows the credential rewritten in auth.json: a
+/// peer process's OAuth refresh rotates the stored token, and a session that
+/// kept the token it was built with sends a revoked one for as long as it lives.
+#[test]
+fn every_request_reads_the_current_stored_credential() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let script = serde_json::json!({
+        "responses": [{"text": "first reply"}, {"text": "second reply"}],
+    });
+    let parsed = pa_ai::faux::script::parse_faux_script(&script).expect("faux script parses");
+    let registration = pa_ai::faux::script::register_faux_provider_from_script(&parsed);
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "faux": {
+                    "api": "faux",
+                    "baseUrl": "http://localhost:0",
+                    "apiKey": "sk-models-json",
+                    "models": [{
+                        "id": "faux-1",
+                        "name": "Faux Model",
+                        "contextWindow": 128_000,
+                        "maxTokens": 16384,
+                    }],
+                },
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::json!({ "defaultProvider": "faux", "defaultModel": "faux-1" }).to_string(),
+    )
+    .unwrap();
+    let write_stored_key = |key: &str| {
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            serde_json::json!({ "faux": { "type": "api_key", "key": key } }).to_string(),
+        )
+        .unwrap();
+    };
+    write_stored_key("sk-before");
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: agent_dir.clone(),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: None,
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(&engine, "first turn".to_string(), &mut events);
+    write_stored_key("sk-after-rotation");
+    admit(&engine, "second turn".to_string(), &mut events);
+    assert_eq!(
+        registration.received_api_keys(),
+        vec![
+            Some("sk-before".to_string()),
+            Some("sk-after-rotation".to_string())
+        ]
+    );
+}

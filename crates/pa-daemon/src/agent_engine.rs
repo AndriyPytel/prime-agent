@@ -18,7 +18,7 @@ use pa_core::session_engine::agent_messaging::{
 };
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
 use pa_core::session_engine::provider_adapter::{
-    json_round_trip, map_thinking_level, switchable_stream_fn, ProviderTarget,
+    json_round_trip, map_thinking_level, resolving_stream_fn, ProviderTarget,
 };
 use pa_core::session_engine::session_commands::{
     execute_session_command, SessionCommandExecution, SessionCommandParams,
@@ -173,7 +173,7 @@ pub struct AgentSessionEngine {
     session_file: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The authoritative model selection: the process fallback, re-bound when
     /// a create carries explicit wire flags.
-    selection: std::sync::RwLock<EngineModelSelection>,
+    selection: std::sync::Arc<std::sync::RwLock<EngineModelSelection>>,
     /// The restored-from-session decision, scoped to the file it was computed
     /// for: a revived session's saved model (or the fallback message); an
     /// explicit flag wins.

@@ -91,6 +91,47 @@ pub struct ProviderTarget {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
+/// The credentials for one request against a model: its api key and auth-resolved headers.
+pub type RequestAuth = Arc<
+    dyn Fn(
+            &Model,
+        ) -> (
+            Option<String>,
+            Option<std::collections::BTreeMap<String, String>>,
+        ) + Send
+        + Sync,
+>;
+
+/// [`switchable_stream_fn`] with the credentials resolved on every request instead of read from
+/// the target: a session that outlives its OAuth access token sends the one a peer refreshed.
+///
+/// # Panics
+///
+/// Panics at stream time if the provider target lock is poisoned, or if the
+/// target slot was never set before the first stream.
+pub fn resolving_stream_fn(
+    target: Arc<std::sync::RwLock<Option<ProviderTarget>>>,
+    auth: RequestAuth,
+) -> StreamFn {
+    Arc::new(
+        move |_requested: AgentModel, context: LlmContext, options: StreamRequestOptions| {
+            let ProviderTarget {
+                model,
+                service_tier,
+                ..
+            } = target
+                .read()
+                .expect("provider target lock")
+                .clone()
+                .expect("provider target set before the first stream");
+            let (api_key, headers) = auth(&model);
+            Box::pin(async move {
+                stream_once(&model, api_key, service_tier, headers, context, options)
+            })
+        },
+    )
+}
+
 /// A real pa-ai stream adapter reading its target from a shared slot the host can swap live
 /// (`set_model`, failover); `None` only before the host sets the build-time target.
 ///

@@ -1,10 +1,11 @@
 //! The engine's lifecycle surface: the constructor and the session
 //! build/adopt/retire cycle, the closed-state markers, the skill
 //! expansion and session-command funnels, and the kernel host wiring.
+use super::model::request_key_and_headers;
 use super::{
     execute_session_command, json_round_trip, map_thinking_level,
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
-    switchable_stream_fn, AgentEngineConfig, AgentSessionEngine, Arc, CoreSessionEngine,
+    resolving_stream_fn, AgentEngineConfig, AgentSessionEngine, Arc, CoreSessionEngine,
     EngineModelSelection, HostRequestHandlers, LinkAgentMessageController,
     LinkAgentObserveController, Model, OverflowRecovery, ProducerUsageSink, ProviderTarget,
     QuotaParkState, SessionCommandExecution, SessionCommandParams, SessionEngineConfig,
@@ -147,7 +148,7 @@ impl AgentSessionEngine {
             kernel_release_probe: std::sync::Mutex::new(None),
             registered_jobs_probe: std::sync::Mutex::new(None),
             session_file,
-            selection: std::sync::RwLock::new(selection.clone()),
+            selection: std::sync::Arc::new(std::sync::RwLock::new(selection.clone())),
             restored_model: std::sync::Mutex::new(None),
             startup_scope: std::sync::Mutex::new(None),
             initial_selection: std::sync::RwLock::new(selection),
@@ -835,7 +836,20 @@ impl AgentSessionEngine {
         // The session's stream reads its target from the live slot:
         // `set_model` swaps it so the built session follows without a
         // rebuild.
-        let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&self.provider_target));
+        let stream_fn = {
+            let agent_dir = self.config.agent_dir.clone();
+            let selection = std::sync::Arc::clone(&self.selection);
+            resolving_stream_fn(
+                std::sync::Arc::clone(&self.provider_target),
+                std::sync::Arc::new(move |model| {
+                    request_key_and_headers(
+                        &agent_dir,
+                        &selection.read().expect("model selection lock"),
+                        model,
+                    )
+                }),
+            )
+        };
         {
             let (api_key, headers) = self.resolve_request_key_and_headers(model);
             let mut target = self.provider_target.write().expect("provider target lock");

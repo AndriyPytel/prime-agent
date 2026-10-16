@@ -374,17 +374,7 @@ impl AgentSessionEngine {
         Option<String>,
         Option<std::collections::BTreeMap<String, String>>,
     ) {
-        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let mut registry =
-            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        let resolved = registry.get_api_key_and_headers(model, model.headers.as_ref());
-        if let Some(api_key) = &self.current_selection().api_key {
-            // The create-config key override pins the key, never the headers:
-            // the registry's merged headers still ship, exactly like the TS
-            // `getApiKeyAndHeaders` override path.
-            return (Some(api_key.clone()), resolved.headers);
-        }
-        (resolved.api_key, resolved.headers)
+        request_key_and_headers(&self.config.agent_dir, &self.current_selection(), model)
     }
 
     pub(crate) fn resolve_request_api_key(&self, model: &Model) -> Option<String> {
@@ -398,6 +388,28 @@ impl AgentSessionEngine {
             .get_api_key_and_headers(model, model.headers.as_ref())
             .api_key
     }
+}
+
+/// The request-time api key and headers from the credential store as it is now, so a token
+/// another process refreshed is picked up; the selection's key override pins the key alone.
+pub(crate) fn request_key_and_headers(
+    agent_dir: &std::path::Path,
+    selection: &EngineModelSelection,
+    model: &Model,
+) -> (
+    Option<String>,
+    Option<std::collections::BTreeMap<String, String>>,
+) {
+    let auth = pa_core::auth::AuthStorage::create(agent_dir);
+    let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
+    let resolved = registry.get_api_key_and_headers(model, model.headers.as_ref());
+    if let Some(api_key) = &selection.api_key {
+        // The create-config key override pins the key, never the headers:
+        // the registry's merged headers still ship, exactly like the TS
+        // `getApiKeyAndHeaders` override path.
+        return (Some(api_key.clone()), resolved.headers);
+    }
+    (resolved.api_key, resolved.headers)
 }
 
 /// The last persisted `rlm_max_depth_state` custom entry in a session
