@@ -307,8 +307,6 @@ pub(crate) struct HostedSession {
     mapping: WireMappingState,
     observed_children: std::collections::HashSet<String>,
     settled_children: std::collections::HashSet<String>,
-    /// Children announced to Air as background tasks (they outlived a turn).
-    background_children: std::collections::HashSet<String>,
     /// The one-shot `available_commands_update`; dropped with the session.
     commands_task: Option<tokio::task::JoinHandle<()>>,
     /// The settle task of a prompt that answered before the family went
@@ -637,44 +635,20 @@ fn spawn_event_consumer(
                                 }
                             }
                         }
-                        let mut progress = None;
                         if let (Some(ctx), Some(child)) = (guard_ctx.as_ref(), event.get("child")) {
                             let id = child_acp_id(child);
-                            let background = current.background_children.contains(&id);
-                            match child_terminal_state(child) {
-                                Some(state) if current.settled_children.insert(id.clone()) => {
-                                    let update = if background {
-                                        background_task_finished(child, state)
-                                    } else {
-                                        types::AcpSessionUpdate::SubagentStateUpdate {
-                                            subagent_session_id: id.clone(),
-                                            state: state.to_string(),
-                                        }
-                                    };
-                                    settled = Some((
-                                        ctx.clone(),
-                                        Arc::clone(&current.producer),
-                                        id,
-                                        update,
-                                    ));
-                                }
-                                None if background => {
-                                    progress = Some(types::AcpSessionUpdate::AsyncTaskProgress {
-                                        async_task_id: id,
-                                        duration_ms: child.get("durationMs").and_then(Value::as_u64),
-                                        usage: child
-                                            .get("tokenCount")
-                                            .and_then(Value::as_u64)
-                                            .map(|tokens| json!({ "totalTokens": tokens })),
-                                    });
-                                }
-                                _ => {}
+                            if let Some(state) = child_terminal_state(child)
+                                .filter(|_| current.settled_children.insert(id.clone()))
+                            {
+                                let update = types::AcpSessionUpdate::SubagentStateUpdate {
+                                    subagent_session_id: id.clone(),
+                                    state: state.to_string(),
+                                };
+                                settled =
+                                    Some((ctx.clone(), Arc::clone(&current.producer), id, update));
                             }
                         }
                         let turn_id = current.producer.active_prompt_turn().await;
-                        if let Some(update) = progress {
-                            current.producer.publish_event(&update, turn_id, false).await;
-                        }
                         if let Some((_, child)) = new_child.as_ref() {
                             current
                                 .producer
@@ -1688,7 +1662,6 @@ async fn handle_session_new(
         mapping: WireMappingState::default(),
         observed_children: std::collections::HashSet::new(),
         settled_children: std::collections::HashSet::new(),
-        background_children: std::collections::HashSet::new(),
         commands_task: None,
         pending_terminal: None,
     };
@@ -2256,16 +2229,7 @@ async fn prompt_turn(
     {
         hosted.pending_terminal = Some(settle.abort_handle());
     }
-    // Air disconnects every native subagent when the prompt answers, so an Air
-    // turn stays open until the family is quiet; a user message meanwhile
-    // arrives as `_session/steering`.
-    let hold_for_family = state.lock().await.air;
-    let settle_wait = if hold_for_family {
-        Ok((&mut settle).await)
-    } else {
-        tokio::time::timeout(PROMPT_SETTLE_GRACE, &mut settle).await
-    };
-    let settled_status = match settle_wait {
+    let settled_status = match tokio::time::timeout(PROMPT_SETTLE_GRACE, &mut settle).await {
         Err(_) => None,
         Ok(joined) => {
             if let Some(hosted) = state.lock().await.session.as_mut() {
@@ -2303,8 +2267,9 @@ async fn prompt_turn(
         settled_status.as_ref().or(autonomous_status.as_ref()),
         assistant_stop_reason,
     );
-    announce_background_children(link, state, &producer, &hosted_daemon_session_id, turn_id)
-        .await;
+    if settled_status.is_none() {
+        publish_usage_update(link, state, &hosted_daemon_session_id, &producer, turn_id).await;
+    }
     jsonrpc::response(
         &id,
         &serde_json::to_value(types::AcpStopReasonResponse { stop_reason }).expect("serializes"),
@@ -2358,6 +2323,7 @@ async fn settle_terminal(
         if terminal_quiescence.outstanding_subagents != 0 {
             continue;
         }
+        publish_usage_update(&link, &state, &daemon_session_id, &producer, turn_id).await;
         // TS `sealTerminal`: the terminal frame is the last update stamped
         // with this turn; later events resume turn 0.
         producer.finish_prompt(turn_id).await;
@@ -2525,14 +2491,21 @@ fn changes_context_usage(event: &Value) -> bool {
     }
 }
 
-fn usage_update(state: &Value) -> Option<types::AcpSessionUpdate> {
+fn usage_update(state: &Value, stats: Option<&Value>) -> Option<types::AcpSessionUpdate> {
     let usage = state.get("contextUsage")?;
     let used = usage.get("tokens")?.as_u64()?;
     let size = usage
         .get("contextWindow")?
         .as_u64()
         .filter(|size| *size > 0)?;
-    Some(types::AcpSessionUpdate::UsageUpdate { used, size })
+    let cost = stats
+        .and_then(|stats| stats.get("cost"))
+        .and_then(Value::as_f64)
+        .map(|amount| types::UsageCost {
+            amount,
+            currency: "USD",
+        });
+    Some(types::AcpSessionUpdate::UsageUpdate { used, size, cost })
 }
 
 async fn publish_usage_update(
@@ -2552,12 +2525,22 @@ async fn publish_usage_update(
     else {
         return;
     };
+    let session_stats = link
+        .request(DaemonCommand::GetSessionStats {
+            id: None,
+            active_session_id: daemon_session_id.to_string(),
+            rest: Map::default(),
+        })
+        .await
+        .ok()
+        .filter(|stats| stats.success)
+        .and_then(|stats| stats.data);
     let Some(update) = response
         .success
         .then_some(response.data)
         .flatten()
         .as_ref()
-        .and_then(usage_update)
+        .and_then(|state| usage_update(state, session_stats.as_ref()))
     else {
         return;
     };
@@ -2879,63 +2862,6 @@ async fn settle_watch_host(
     }
 }
 
-/// Announce the children still running as the turn ends as background tasks.
-async fn announce_background_children(
-    link: &Arc<DaemonLink>,
-    state: &Arc<Mutex<DaemonAcpState>>,
-    producer: &Arc<UpdateProducer>,
-    daemon_session_id: &str,
-    turn_id: u64,
-) {
-    if state.lock().await.watch_ctx.is_none() {
-        return;
-    }
-    let Ok(children) = fetch_rlm_children(link, daemon_session_id).await else {
-        return;
-    };
-    let mut guard = state.lock().await;
-    let Some(hosted) = guard.session.as_mut() else {
-        return;
-    };
-    for child in &children {
-        if outstanding_subagents(std::slice::from_ref(child)) > 0
-            && hosted.background_children.insert(child_acp_id(child))
-        {
-            let _ = producer
-                .publish(
-                    &background_task_spawned(child),
-                    turn_id,
-                    PrimeAgentEventPhase::Event,
-                    None,
-                )
-                .await;
-        }
-    }
-}
-
-/// Air marks every native subagent `disconnected` when the parent's turn
-/// ends, so a child that outlives the turn continues as a background task.
-fn background_task_spawned(child: &Value) -> types::AcpSessionUpdate {
-    let text = |key: &str| child.get(key).and_then(Value::as_str).map(str::to_string);
-    types::AcpSessionUpdate::AsyncTaskSpawned {
-        async_task_id: child_acp_id(child),
-        name: text("sessionName").unwrap_or_else(|| child_acp_id(child)),
-        task_type: "subagent".to_string(),
-        description: text("label").unwrap_or_default(),
-        show_in_transcript: true,
-        output_file_path: text("sessionFile"),
-    }
-}
-
-fn background_task_finished(child: &Value, state: &str) -> types::AcpSessionUpdate {
-    let text = |key: &str| child.get(key).and_then(Value::as_str).map(str::to_string);
-    types::AcpSessionUpdate::AsyncTaskStateUpdate {
-        async_task_id: child_acp_id(child),
-        state: if state == "cancelled" { "stopped" } else { state }.to_string(),
-        summary: text("answerPreview").or_else(|| text("error")),
-    }
-}
-
 fn child_acp_id(child: &Value) -> String {
     ["sessionId", "id"]
         .iter()
@@ -2949,7 +2875,10 @@ fn subagent_spawned(child: &Value) -> types::AcpSessionUpdate {
     types::AcpSessionUpdate::SubagentSpawned {
         subagent_session_id: child_acp_id(child),
         name: text("sessionName").unwrap_or_else(|| child_acp_id(child)),
-        task: text("label").unwrap_or_default(),
+        task: text("label")
+            .filter(|label| !label.trim().is_empty())
+            .or_else(|| text("sessionName"))
+            .unwrap_or_else(|| child_acp_id(child)),
         capabilities: json!({}),
     }
 }
@@ -2994,7 +2923,6 @@ async fn open_watch_host(ctx: &WatchCtx, parent_id: &str, child: &Value) -> anyh
         mapping: WireMappingState::default(),
         observed_children: std::collections::HashSet::new(),
         settled_children: std::collections::HashSet::new(),
-        background_children: std::collections::HashSet::new(),
         commands_task: None,
         pending_terminal: None,
     };
@@ -3079,7 +3007,6 @@ mod tests {
             mapping: WireMappingState::default(),
             observed_children: std::collections::HashSet::new(),
             settled_children: std::collections::HashSet::new(),
-            background_children: std::collections::HashSet::new(),
             commands_task: None,
             pending_terminal: None,
         }
@@ -3128,21 +3055,39 @@ mod tests {
     fn usage_update_needs_known_tokens_and_a_positive_window() {
         let state = |usage: Value| json!({ "contextUsage": usage });
         assert_eq!(
-            usage_update(&state(json!({ "tokens": 12, "contextWindow": 100 }))),
+            usage_update(&state(json!({ "tokens": 12, "contextWindow": 100 })), None),
             Some(types::AcpSessionUpdate::UsageUpdate {
                 used: 12,
-                size: 100
+                size: 100,
+                cost: None
             })
         );
         assert_eq!(
-            usage_update(&state(json!({ "tokens": null, "contextWindow": 100 }))),
+            usage_update(
+                &state(json!({ "tokens": null, "contextWindow": 100 })),
+                None
+            ),
             None
         );
         assert_eq!(
-            usage_update(&state(json!({ "tokens": 12, "contextWindow": 0 }))),
+            usage_update(&state(json!({ "tokens": 12, "contextWindow": 0 })), None),
             None
         );
-        assert_eq!(usage_update(&json!({})), None);
+        assert_eq!(usage_update(&json!({}), None), None);
+        assert_eq!(
+            usage_update(
+                &state(json!({ "tokens": 12, "contextWindow": 100 })),
+                Some(&json!({ "cost": 0.25 }))
+            ),
+            Some(types::AcpSessionUpdate::UsageUpdate {
+                used: 12,
+                size: 100,
+                cost: Some(types::UsageCost {
+                    amount: 0.25,
+                    currency: "USD"
+                })
+            })
+        );
     }
 
     #[tokio::test]

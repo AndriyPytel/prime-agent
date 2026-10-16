@@ -278,7 +278,11 @@ mod tests {
     }
 
     fn usage() -> AcpSessionUpdate {
-        AcpSessionUpdate::UsageUpdate { used: 1, size: 2 }
+        AcpSessionUpdate::UsageUpdate {
+            used: 1,
+            size: 2,
+            cost: None,
+        }
     }
 
     fn info() -> AcpSessionUpdate {

@@ -26,8 +26,6 @@ pub struct AgentCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_capabilities: Option<McpCapabilities>,
     pub session_capabilities: SessionCapabilities,
-    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
-    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,41 +204,14 @@ pub enum AcpSessionUpdate {
         subagent_session_id: String,
         state: String,
     },
-    /// An Air background task: a child still running after its parent's turn ended.
-    #[serde(rename = "async_task_spawned")]
-    AsyncTaskSpawned {
-        #[serde(rename = "asyncTaskId")]
-        async_task_id: String,
-        name: String,
-        #[serde(rename = "taskType")]
-        task_type: String,
-        description: String,
-        #[serde(rename = "showInTranscript")]
-        show_in_transcript: bool,
-        #[serde(rename = "outputFilePath", skip_serializing_if = "Option::is_none")]
-        output_file_path: Option<String>,
-    },
-    #[serde(rename = "async_task_progress")]
-    AsyncTaskProgress {
-        #[serde(rename = "asyncTaskId")]
-        async_task_id: String,
-        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
-        duration_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<Value>,
-    },
-    /// `running`, `paused`, `completed`, `failed` or `stopped`.
-    #[serde(rename = "async_task_state_update")]
-    AsyncTaskStateUpdate {
-        #[serde(rename = "asyncTaskId")]
-        async_task_id: String,
-        state: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
-    },
     /// Context window occupancy after an assistant message or compaction.
     #[serde(rename = "usage_update")]
-    UsageUpdate { used: u64, size: u64 },
+    UsageUpdate {
+        used: u64,
+        size: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost: Option<UsageCost>,
+    },
     /// The session's configuration options changed (TS #2455): the
     /// full set with current values, connection-scoped.
     #[serde(rename = "config_option_update")]
@@ -449,6 +420,13 @@ impl SetConfigOptionParams {
 }
 
 /// The initialize result with the served capability set.
+/// The session's cumulative spend; Air shows it only in USD.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageCost {
+    pub amount: f64,
+    pub currency: &'static str,
+}
+
 /// The `_meta` an Air client expects to see to show subagents natively.
 pub fn air_meta() -> Value {
     json!({ "jetbrains": { "air": { "version": 1, "capabilities": ["nativeSubagentSessions"] } } })
@@ -478,7 +456,6 @@ pub fn initialize_result(product_version: &str, air: bool) -> InitializeResult {
                 resume: CloseCapability::default(),
                 fork: CloseCapability::default(),
             },
-            meta: air.then(air_meta),
         },
         agent_info: AgentInfo {
             name: "prime-agent".to_string(),
@@ -489,6 +466,7 @@ pub fn initialize_result(product_version: &str, air: bool) -> InitializeResult {
             let mut meta =
                 super::meta::prime_agent_meta(&super::meta::PrimeAgentSessionMeta::default());
             if air {
+                meta["jetbrains"] = air_meta()["jetbrains"].take();
                 meta["steering"] = serde_json::json!({ "supported": true });
             }
             meta

@@ -338,7 +338,7 @@ fn acp_air_client_gets_native_subagent_capability_and_others_do_not() {
     let id = air.request("initialize", &air_initialize_params());
     let (response, _) = air.wait_response(id, TIMEOUT);
     assert_eq!(
-        response["result"]["agentCapabilities"]["_meta"]["jetbrains"]["air"]["capabilities"],
+        response["result"]["_meta"]["jetbrains"]["air"]["capabilities"],
         json!(["nativeSubagentSessions"])
     );
     assert_eq!(
@@ -412,32 +412,36 @@ fn acp_air_child_streams_as_a_native_subagent_session() {
 }
 
 #[test]
-fn acp_air_turn_stays_open_until_its_children_settle() {
+fn acp_air_child_outliving_the_turn_settles_its_native_subagent_row() {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
-    let (mut client, session_id) = air_spawn_lane(4_000, &kernel_python);
+    let (mut client, session_id) = air_spawn_lane(6_000, &kernel_python);
     let prompt = client.request(
         "session/prompt",
         &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
     );
     let (response, updates) = client.wait_response(prompt, TIMEOUT);
     assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
-    let done = updates
-        .iter()
-        .find(|f| is_update(f, &session_id, "subagent_state_update"))
-        .expect("the kid settles inside the open turn");
-    assert_eq!(done["params"]["update"]["state"], "completed");
     assert!(
-        updates
+        !updates
             .iter()
-            .any(|f| is_update(f, &session_id, "agent_message_chunk")
-                && f["params"]["update"]["_meta"]["jetbrains"]["air"]["phase"] == "final_answer"),
-        "the answer is marked final so Air shows it while the turn stays open"
+            .any(|f| is_update(f, &session_id, "subagent_state_update")),
+        "the turn answered before its child settled"
     );
-    assert!(!updates
+    assert!(updates
         .iter()
-        .any(|f| is_update(f, &session_id, "async_task_spawned")));
+        .any(|f| is_update(f, &session_id, "agent_message_chunk")
+            && f["params"]["update"]["_meta"]["jetbrains"]["air"]["phase"] == "final_answer"));
+    let done = client.wait_frame(TIMEOUT, |f| {
+        is_update(f, &session_id, "subagent_state_update")
+            || is_update(f, &session_id, "async_task_spawned")
+    });
+    assert_eq!(
+        done["params"]["update"]["sessionUpdate"], "subagent_state_update",
+        "{done}"
+    );
+    assert_eq!(done["params"]["update"]["state"], "completed");
 }
 
 #[test]
@@ -507,7 +511,7 @@ fn acp_air_closing_a_child_tab_detaches_without_ending_the_child() {
         return;
     };
     let (mut client, session_id) = air_spawn_lane(4_000, &kernel_python);
-    let prompt = client.request(
+    let _prompt = client.request(
         "session/prompt",
         &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
     );
@@ -529,12 +533,9 @@ fn acp_air_closing_a_child_tab_detaches_without_ending_the_child() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let (response, updates) = client.wait_response(prompt, TIMEOUT);
-    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
-    let done = updates
-        .iter()
-        .find(|f| is_update(f, &session_id, "subagent_state_update"))
-        .expect("the detached kid still settles inside the open turn");
+    let done = client.wait_frame(TIMEOUT, |f| {
+        is_update(f, &session_id, "subagent_state_update")
+    });
     assert_eq!(done["params"]["update"]["state"], "completed", "{done}");
 }
 
