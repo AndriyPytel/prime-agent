@@ -95,9 +95,10 @@ pub(crate) struct CreateSessionResources {
 /// The create command's `--models` scope inputs: the startup chain picks
 /// the first scoped model (or the saved default when in scope) for a
 /// fresh session; a continuing session keeps its own model.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct StartupScope {
     pub(super) scoped_models: Vec<pa_core::models::ScopedModel>,
+    pub(super) patterns: Vec<String>,
     pub(super) is_continuing: bool,
 }
 
@@ -112,11 +113,9 @@ impl pa_core::session_engine::rlm_usage::RlmChildUsageSink for ProducerUsageSink
     fn record(
         &self,
         report: pa_core::session_engine::rlm_usage::RlmChildUsageReport,
-    ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let producer = std::sync::Arc::clone(&self.0);
-        Box::pin(async move {
-            producer.record_child_usage(report).await;
-        })
+        Box::pin(async move { producer.record_child_usage(report).await })
     }
 
     fn forget(

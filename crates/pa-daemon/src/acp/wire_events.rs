@@ -16,9 +16,6 @@ use serde_json::{json, Value};
 use super::meta::{prime_agent_meta, PrimeAgentCompactionMeta, PrimeAgentSessionMeta};
 use super::types::{AcpSessionUpdate, AcpToolKind, AcpToolStatus, TextBlock, ToolCallContent};
 
-/// The model-facing Python REPL tool.
-const IPYTHON_TOOL_NAME: &str = "ipython";
-
 /// Correlates streamed chunks with their owning assistant message (the
 /// daemon stream carries the delta on `assistantMessageEvent`) and bash
 /// output chunks with the run that produced them.
@@ -282,7 +279,7 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
                 .unwrap_or_default()
                 .to_string();
             let args = event.get("args").cloned().unwrap_or(Value::Null);
-            let cell = if tool_name == IPYTHON_TOOL_NAME {
+            let cell = if pa_types::ai::is_python_tool_name(&tool_name) {
                 args.get("code").and_then(Value::as_str).map(str::to_string)
             } else {
                 None
@@ -942,7 +939,7 @@ mod tests {
         let value = serde_json::to_value(&updates[0]).unwrap();
         assert_eq!(value["sessionUpdate"], "tool_call");
         assert_eq!(value["title"], "print(1)");
-        assert_eq!(value["kind"], "other");
+        assert_eq!(value["kind"], "execute");
         assert_eq!(value["rawInput"], json!({ "code": "print(1)" }));
         let updates = wire_updates(
             &json!({
@@ -1241,7 +1238,7 @@ mod tests {
         let mut state = WireMappingState::default();
         let updates = wire_updates(&ipython_start("c", "s = '```'"), &mut state);
         let value = updates[0].to_bare_value();
-        assert_eq!(value["kind"], "other");
+        assert_eq!(value["kind"], "execute");
         assert_eq!(value["rawInput"], json!({ "code": "s = '```'" }));
         assert_eq!(
             content_texts(&updates[0]),

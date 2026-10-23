@@ -15,7 +15,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use pa_core::prompts::layers::{self, CORE_LAYER, OPINIONATED_LAYER, PER_MODEL_MAP, USAGE_LAYER};
+use pa_core::prompts::layers::{CORE_LAYER, OPINIONATED_LAYER, USAGE_LAYER};
+use pa_core::prompts::model_prompts::MODEL_PROMPTS_TOML;
 use pa_core::prompts::system_prompt::{
     system_prompt_breakdown, BuildSystemPromptOptions, SegmentKind,
 };
@@ -52,7 +53,6 @@ const DYNAMIC_ONLY_MARKERS: &[&str] = &[
     "<available_skills>",
     "Enabled generic MCP servers:",
     "# Project Context",
-    "# Additional Guidance",
     "Pre-installed Python packages:",
     "You are a child agent spawned by",
 ];
@@ -63,7 +63,7 @@ fn static_layers_contain_no_dynamic_content() {
         ("core", CORE_LAYER),
         ("usage", USAGE_LAYER),
         ("opinionated", OPINIONATED_LAYER),
-        ("per-model", PER_MODEL_MAP),
+        ("model-prompts", MODEL_PROMPTS_TOML),
     ] {
         for marker in DYNAMIC_ONLY_MARKERS {
             assert!(
@@ -80,9 +80,9 @@ fn cached_prefix_is_stable_across_sessions() {
     let mut options = BuildSystemPromptOptions {
         cwd: "/first/cwd".to_string(),
         messages_path: Some("/first/session.jsonl".to_string()),
-        model: Some("mock/mock-1"),
+        model_prompt_extras: Some("model guidance."),
         skills: sorted_bundled_skills(),
-        selected_tools: Some(vec!["ipython"]),
+        selected_tools: Some(vec!["python_repl"]),
         ..Default::default()
     };
     let first = system_prompt_breakdown(&options);
@@ -93,7 +93,6 @@ fn cached_prefix_is_stable_across_sessions() {
     options.rlm_parent_agent = Some("orchestrator");
     options.generic_mcp_servers = vec!["slack".into(), "github".into()];
     options.context_files = vec![("AGENTS.md".into(), "Never commit main.".into())];
-    options.prompt_guidelines = Some(vec!["prefer tabs".into()]);
     options.append_system_prompt = Some("And one more thing.".into());
     let second = system_prompt_breakdown(&options);
 
@@ -104,7 +103,12 @@ fn cached_prefix_is_stable_across_sessions() {
     );
     assert_eq!(
         &first.assembled[..first.cached_prefix_len],
-        layers::static_prefix(Some("mock/mock-1"))
+        &format!(
+            "{}\n\n{}\n\n{}\n\nmodel guidance.",
+            CORE_LAYER.trim(),
+            USAGE_LAYER.trim(),
+            OPINIONATED_LAYER.trim()
+        )
     );
 
     let first_tail = &first.assembled[first.cached_prefix_len..];
@@ -119,7 +123,6 @@ fn cached_prefix_is_stable_across_sessions() {
     assert!(second_tail.contains("Recursive agent depth: 3 (not root)"));
     assert!(second_tail.contains("You are a child agent spawned by orchestrator."));
     assert!(second_tail.contains("# Project Context"));
-    assert!(second_tail.contains("# Additional Guidance"));
     assert!(second_tail.ends_with("And one more thing."));
 
     for segment in &first.segments {
@@ -140,8 +143,18 @@ fn cached_prefix_is_stable_across_sessions() {
 
 /// Host-request types that are host-internal plumbing, not model-facing
 /// programmatic tools (the prompt must not document them).
-const INTERNAL_HOST_REQUESTS: &[&str] =
-    &["model.info", "mcp.config", "mcp.refresh", "mcp.begin_login"];
+const INTERNAL_HOST_REQUESTS: &[&str] = &[
+    "model.info",
+    "mcp.config",
+    "mcp.refresh",
+    "mcp.begin_login",
+    // The runtime's detached-bash notice pair (the kernel's bash module
+    // fires them; the model never calls them).
+    "bash.completed",
+    "bash.consumed",
+    // The factory module reports run milestones; the model never calls it.
+    "factory.progress",
+];
 
 /// Map one registered host-request type to the prompt token that documents
 /// it. `None` when the request is host-internal.
@@ -227,12 +240,17 @@ fn registered_host_requests() -> BTreeSet<String> {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read source");
-            // Direct registrations: the first string literal after each
-            // `.register(` (the request type comes first in the call).
+            // Direct registrations: the request type is the FIRST
+            // argument of each `.register(` — a literal right at the
+            // call's head counts; anything after a non-literal first
+            // argument is not the request type.
             for remainder in source.split(".register(").skip(1) {
-                if let Some(literal) = first_string_literal(remainder) {
-                    if is_request_type_literal(&literal) {
-                        found.insert(literal);
+                let rest = remainder.trim_start();
+                if rest.starts_with('"') {
+                    if let Some(literal) = first_string_literal(rest) {
+                        if is_request_type_literal(&literal) {
+                            found.insert(literal);
+                        }
                     }
                 }
             }
@@ -281,7 +299,7 @@ fn all_string_literals(text: &str) -> Vec<String> {
 /// Kernel-bound REPL names from the real bootstrap code (`rlm`, `bash`,
 /// `mcp`), derived from `build_rlm_bootstrap_code`.
 fn kernel_bound_names() -> BTreeSet<String> {
-    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[]);
+    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[], false);
     let mut names = BTreeSet::new();
     for line in code.lines() {
         let line = line.trim_start();
@@ -532,6 +550,29 @@ fn bundled_skills_match_the_ts_packaged_set() {
     );
 }
 
+/// The bounded-await contract renders wherever the Python REPL does: every session kind, daemon
+/// or daemonless, registers the bash completion notice the degrade relies on.
+#[test]
+fn bounded_await_contract_renders_in_daemon_and_daemonless_sessions() {
+    let mut options = BuildSystemPromptOptions {
+        cwd: "/w".to_string(),
+        messages_path: Some("/log.jsonl".to_string()),
+        skills: sorted_bundled_skills(),
+        selected_tools: Some(vec!["python_repl"]),
+        ..Default::default()
+    };
+    for daemonless in [false, true] {
+        options.daemonless = daemonless;
+        let prompt = system_prompt_breakdown(&options).assembled;
+        assert!(
+            prompt.contains("yield_after")
+                && prompt.contains("`r.running` is True")
+                && prompt.contains("`r.exit_code` is None"),
+            "daemonless={daemonless}: the prompt must carry the bounded-await result contract: {prompt}"
+        );
+    }
+}
+
 /// The generic mcp skill loads through the normal markdown discovery and renders in the
 /// `<available_skills>` inventory exactly like any other markdown skill: the `[skill name
 /// location]`-style XML the TS `formatSkillsForPrompt` emits, without a `python_import` line.
@@ -540,9 +581,8 @@ fn generic_mcp_skill_renders_in_the_prompt_inventory() {
     let mut options = BuildSystemPromptOptions {
         cwd: "/w".to_string(),
         messages_path: Some("/log.jsonl".to_string()),
-        model: Some("mock/mock-1"),
         skills: sorted_bundled_skills(),
-        selected_tools: Some(vec!["ipython"]),
+        selected_tools: Some(vec!["python_repl"]),
         ..Default::default()
     };
     let breakdown = system_prompt_breakdown(&options);

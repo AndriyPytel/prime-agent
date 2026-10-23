@@ -205,6 +205,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  discussion-notifier:
+    name: discussion notification contract
+    needs: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    if: needs.trust.result == 'success' && needs.trust.outputs.allowed == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/discussion-notifier/test_notify.py
+
   migration-packaging:
     name: historical upgrade packaging
     needs: trust
@@ -219,7 +231,9 @@ jobs:
         run: |
           python3 scripts/release/test_native_compat.py
           python3 scripts/release/test_npm_bridge.py
+          python3 scripts/release/test_release_publication.py
           python3 scripts/release/test_restamp.py
+          python3 scripts/release/test_channel_version.py
 
   clippy-test:
     name: check + clippy (workspace)
@@ -330,15 +344,50 @@ jobs:
       - name: Bootstrap the kernel venv (ready before the kernel e2e units)
         if: steps.selection.outputs.units != '0'
         run: ./target/debug/prime-agent --prime-agent-bootstrap
-      - name: Run this shard's test subset
+      # The real-binary lifecycle checks drive the debug binary through owned
+      # daemons, PTYs and loopback providers only. One leg is enough.
+      - name: Run the rust lifecycle checks
+        id: lifecycle_checks
+        if: matrix.shard == 1 && steps.selection.outputs.units != '0' && hashFiles('scripts/check_*.py') != ''
         run: |
-          python3 scripts/ci_test_shard.py --shard ${{ matrix.shard }} --total ${{ env.SHARD_COUNT }}             --crates "${{ needs.changes.outputs.crates }}"             --manifest "$RUNNER_TEMP/shard-manifest-${{ matrix.shard }}.json"
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/lifecycle-check-receipts"
+          export PA_RUST_BINARY="${GITHUB_WORKSPACE}/target/debug/prime-agent"
+          export PRIME_AGENT_KERNEL_PYTHON="${HOME}/.prime/agent/kernel-venv/bin/python"
+          export PA_E2E_KERNEL_PYTHON="${PRIME_AGENT_KERNEL_PYTHON}"
+          test -x "${PRIME_AGENT_KERNEL_PYTHON}"
+          check_status=0
+          python3 scripts/test_lifecycle_lib.py || check_status=1
+          # Discover independently added checks so feature PRs do not
+          # overwrite or conflict with each other's selection.
+          for check in scripts/check_*.py; do
+            [ -f "${check}" ] || continue
+            scenario="${check#scripts/check_}"
+            scenario="${scenario%.py}"
+            check_test="scripts/test_check_${scenario}.py"
+            if [ -f "${check_test}" ]; then
+              python3 "${check_test}" || check_status=1
+            fi
+            python3 "${check}" --receipt "${RUNNER_TEMP}/lifecycle-check-receipts/${scenario}.json" || check_status=1
+          done
+          exit "${check_status}"
+      - name: Upload the lifecycle check receipts
+        if: always() && matrix.shard == 1 && steps.selection.outputs.units != '0' && hashFiles('scripts/check_*.py') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lifecycle-check-receipts-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lifecycle-check-receipts/
+          if-no-files-found: error
+      - name: Run this shard's test subset
+        if: ${{ !cancelled() && (success() || steps.lifecycle_checks.outcome == 'failure') }}
+        run: |
+          python3 scripts/ci_test_shard.py --shard ${{ matrix.shard }} --total ${{ env.SHARD_COUNT }}             --crates "${{ needs.changes.outputs.crates }}"             --manifest "$RUNNER_TEMP/shard-manifest-${{ matrix.shard }}-attempt-${{ github.run_attempt }}.json"
       - name: Upload the shard manifest (always — the summary audits it)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: shard-manifest-${{ matrix.shard }}
-          path: ${{ runner.temp }}/shard-manifest-${{ matrix.shard }}.json
+          name: shard-manifest-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard-manifest-${{ matrix.shard }}-attempt-${{ github.run_attempt }}.json
 
   # The aggregate: audits the partition (same enumeration everywhere,
   # disjoint shards, every assigned unit executed — coverage can never
@@ -360,7 +409,34 @@ jobs:
           merge-multiple: true
           path: manifests
       - name: Audit the shards and merge their failure reports
-        run: python3 scripts/ci_test_shard_summary.py --total ${{ env.SHARD_COUNT }} --dir manifests
+        run: |
+          python3 scripts/test_ci_test_shard.py
+          python3 scripts/test_ci_pr_crates.py
+          python3 scripts/test_ci_test_shard_summary.py
+          python3 scripts/ci_test_shard_summary.py --total ${{ env.SHARD_COUNT }} --dir manifests
+
+  # The vendored runtime suite (prime-agent-runtime): the kernel-side Python
+  # (`bash()`, the repl protocol, the bounded-await contract) has no Rust test,
+  # so this is its only CI gate — CPython 3.11, the minimum the runtime
+  # supports and the version the kernel venv pins.
+  runtime:
+    name: runtime suite (python 3.11)
+    needs: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: needs.trust.result == 'success' && needs.trust.outputs.allowed == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install uv
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run the runtime suite (CPython 3.11)
+        run: |
+          cd prime-agent-runtime
+          uv run --python 3.11 python -m unittest discover -s test
 
   # The Windows job set + the supply-chain deny gate:
   #
@@ -419,11 +495,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Dependency audit (cargo-deny advisories + licenses)
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check
-          arguments: --all-features --workspace
-          command-arguments: advisories licenses
+        uses: ./.github/actions/dependency-audit
 
   # The trust gate's own failure made visible: a vouch-step error (the
   # action's setup, the runner) would otherwise leave every dependent job
@@ -436,7 +508,18 @@ jobs:
   # enforces.
   trust-audit:
     name: trust gate audit
-    needs: [trust, changes, fmt, clippy-test, test-shard, test-summary, windows-cross, deny]
+    needs:
+      [
+        trust,
+        changes,
+        fmt,
+        clippy-test,
+        test-shard,
+        test-summary,
+        runtime,
+        windows-cross,
+        deny,
+      ]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10

@@ -1,12 +1,13 @@
 # prime-agent harness
 
-The prime-agent harness has one tool: `ipython`, a persistent CPython REPL. All other tools are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.
+The prime-agent harness has one tool: `python_repl`, a persistent CPython REPL. All other tools are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.
 
 The harness often sends messages to the agent. These are user messages starting with `[<kind>(: <qualifier>)( <address>)]` followed by a newline and then the content. They are not user-generated.
 
 ## Core tools
 
-- `bash(command: str) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `ipython` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
+- `bash(command: str, persistent: bool = False) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `python_repl` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
+  - `persistent=True` (POSIX, saved sessions only): the shell survives kernel, worker, and daemon restarts and its session's delete or archive (a deleted session's shells keep running as orphans); it ends only on its own exit or an explicit kill; use it only when really required (a server or long job that must outlive a restart), never for ordinary commands; after a restart, get the handles back with `from rlm import persistent_shells; persistent_shells()` (a shell that finished while no kernel ran is listed once, finished); completion of a re-attached shell is polled, so its result and notification lag by about a second
   - `BashHandle`:
     - `.pid: int`
     - `.running: bool`
@@ -15,7 +16,7 @@ The harness often sends messages to the agent. These are user messages starting 
     - `.output() -> str`
     - `.poll() -> BashResult | None`
     - `.kill(sig: int = SIGTERM, grace: float = 5.0) -> None`: SIGTERM, escalating to SIGKILL; on Windows kill() uses taskkill /T and detached or reparented descendants may survive
-    - `await handle -> BashResult`: the handle is awaitable even after command completion, so agents can run commands non-blocking and await them after being notified of them finishing
+    - `await handle`: waits according to this session's bash completion contract; the handle remains awaitable after command completion
   - `BashResult`
     - `.exit_code: int`
     - `.output: str`
@@ -87,7 +88,7 @@ Memories are created by two mechanisms:
   - Effect:
     - The refinement event is always saved in the harness state's refinement history
     - A harness message is sent to the agent with the refinement result
-- Active memory management by the agent
+- Active memory management by the agent (the `rlm.harness.*` and `rlm.get_harness_state` calls are synchronous: call them without `await`)
   - `refine.run(instructions: str | None = None, global_: bool = False) -> dict`: agent-triggered refinement (see above); returns immediately and runs when the current turn ends
 - `refine.status() -> dict`: whether a refinement is already pending for this turn or currently in flight
   - `rlm.harness.create_memory(title: str, content: str, *, id: str | None = None, path: str = "general", metadata: dict | None = None, global_: bool = False) -> HarnessEntry`: creates a memory; use `global_=True` for cross-session entries (Python reserves `global`, so the parameter is spelled `global_`)

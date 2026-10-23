@@ -1,7 +1,7 @@
 //! Domain types for the agent loop.
 //!
 //! Serde field names use camelCase so serialized messages match the TS wire
-//! format exactly (important for the proxy protocol and session JSONL parity).
+//! format exactly (important for session JSONL parity).
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -483,6 +483,24 @@ impl AgentToolResult {
 /// Callback used by tools to publish partial execution updates.
 pub type AgentToolUpdateCallback = Arc<dyn Fn(AgentToolResult) + Send + Sync>;
 
+/// Heartbeat cadence for in-flight tool calls: quiet until `after_ms`
+/// elapses, then one [`AgentEvent::ToolExecutionProgress`] every
+/// `every_ms` while the call still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolProgressCadence {
+    pub after_ms: u64,
+    pub every_ms: u64,
+}
+
+impl Default for ToolProgressCadence {
+    fn default() -> Self {
+        ToolProgressCadence {
+            after_ms: 60_000,
+            every_ms: 60_000,
+        }
+    }
+}
+
 /// Tool definition used by the agent runtime.
 ///
 /// The schema is a plain JSON Schema `Value` (TS validates against a `TypeBox`
@@ -499,6 +517,12 @@ pub trait AgentTool: Send + Sync {
     /// validation. Return `None` to keep the arguments unchanged.
     fn prepare_arguments(&self, _args: &serde_json::Value) -> Option<serde_json::Value> {
         None
+    }
+    /// Whether a call naming another tool should dispatch to this one
+    /// (e.g. pre-rename names replayed from history); exact name matches
+    /// win.
+    fn accepts_alias(&self, _name: &str) -> bool {
+        false
     }
     /// Execute the tool call. Return `Err` on failure instead of encoding
     /// errors in `content`, like a `throw` in the TS reference.
@@ -552,6 +576,14 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         args: serde_json::Value,
+    },
+    /// In-flight tool-call heartbeat: emitted on the
+    /// [`AgentLoopConfig::tool_progress`] cadence once a call outlives the
+    /// initial threshold, so a stalled call is visible while it runs.
+    ToolExecutionProgress {
+        tool_call_id: String,
+        tool_name: String,
+        elapsed_ms: u64,
     },
     ToolExecutionUpdate {
         tool_call_id: String,

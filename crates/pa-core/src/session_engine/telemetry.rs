@@ -36,8 +36,8 @@ use super::error_classify::classify_error_message;
 mod track;
 pub use track::{
     track_catalog_refresh, track_compaction_abort_declared, track_daemon_event_summary,
-    track_deleted_child_usage_captured, track_model_refused, track_sessions_archived,
-    track_worker_adoption, track_worker_children_closed,
+    track_deleted_child_usage_captured, track_model_refused, track_worker_adoption,
+    track_worker_children_closed,
 };
 
 mod classify;
@@ -927,7 +927,9 @@ fn handle_event(
         // Both are still run-scoped events: while the cached decision is
         // off they sever (a tool whose execution spans an opt-out observed
         // at a boundary never counts into a surviving run).
-        AgentEvent::TurnEnd { .. } | AgentEvent::ToolExecutionUpdate { .. } => {}
+        AgentEvent::TurnEnd { .. }
+        | AgentEvent::ToolExecutionUpdate { .. }
+        | AgentEvent::ToolExecutionProgress { .. } => {}
     }
 }
 
@@ -1139,7 +1141,10 @@ pub fn build_client(
             config.install_id = id;
             let mut sinks: Vec<Arc<dyn pa_telemetry::TelemetrySink>> = Vec::new();
             if let Some(endpoint) = telemetry_endpoint() {
-                sinks.push(Arc::new(pa_telemetry::AnalyticsSink::new(endpoint)));
+                sinks.push(Arc::new(pa_telemetry::AnalyticsSink::with_http_builder(
+                    endpoint,
+                    pa_ai::utils::tls::http_client_builder(),
+                )));
             }
             let local_mirror = settings
                 .settings()

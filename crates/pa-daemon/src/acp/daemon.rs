@@ -1792,10 +1792,7 @@ async fn handle_session_new(
                 },
             );
             if state != "running" {
-                replay_child_history(
-                    &UpdateProducer::new(child_acp_id(child), tx.clone()),
-                    child,
-                );
+                replay_child_history(&UpdateProducer::new(child_acp_id(child), tx.clone()), child);
             }
             producer.replay(&types::AcpSessionUpdate::SubagentStateUpdate {
                 subagent_session_id: child_acp_id(child),

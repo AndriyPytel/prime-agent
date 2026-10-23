@@ -83,10 +83,11 @@ pub enum AcpToolKind {
 }
 
 impl AcpToolKind {
-    /// The kind map: `execute` makes `JetBrains` open a terminal block whose
-    /// details are nulled on completion, so the Python REPL stays `other`.
+    /// The kind map: the model-facing tool is the Python REPL; bash is the
+    /// secondary escape hatch.
     pub fn of_tool(tool_name: &str) -> AcpToolKind {
         match tool_name {
+            name if pa_types::ai::is_python_tool_name(name) => AcpToolKind::Execute,
             "bash" => AcpToolKind::Execute,
             "read" => AcpToolKind::Read,
             "edit" | "write" => AcpToolKind::Edit,
@@ -500,7 +501,7 @@ mod tests {
 
     #[test]
     fn tool_kind_map_matches_the_ts_map() {
-        assert_eq!(AcpToolKind::of_tool("ipython"), AcpToolKind::Other);
+        assert_eq!(AcpToolKind::of_tool("python_repl"), AcpToolKind::Execute);
         assert_eq!(AcpToolKind::of_tool("bash"), AcpToolKind::Execute);
         assert_eq!(AcpToolKind::of_tool("read"), AcpToolKind::Read);
         assert_eq!(AcpToolKind::of_tool("edit"), AcpToolKind::Edit);

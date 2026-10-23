@@ -16,10 +16,10 @@ mod wire;
 pub use scripted::ScriptedEngine;
 pub(crate) use wire::session_wire_value;
 pub use wire::{
-    empty_resource_snapshot, side_question_event_value, AssistantSnapshot, BashCompletionNotice,
-    BashCompletionSink, BashConsumedNotice, BashConsumedSink, BranchSummaryOutcome,
-    BranchSummaryRequest, BranchSummaryRun, CompactionOutcome, CompactionRequest, CompactionRun,
-    EngineEvent, EngineModelSelection, GoalAdmissionSink, GoalContinuation, GoalTurnEndWork,
+    empty_resource_snapshot, side_question_event_value, AssistantSnapshot, BashConsumedNotice,
+    BashConsumedSink, BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun,
+    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection,
+    GoalAdmissionSink, GoalContinuation, GoalTurnEndWork, KernelNotice, KernelNoticeSink,
     PromptBatchRow, PromptRequest, RlmSessionIdentity, SavedSessionContext, SemanticSpawnOrigin,
     SessionInputProbe, SideQuestionOutcome, SideQuestionRequest, SIDE_QUESTION_STATUS_CANCELLED,
     SIDE_QUESTION_STATUS_COMPLETE, SIDE_QUESTION_STATUS_ERROR, SIDE_QUESTION_STATUS_RUNNING,
@@ -226,6 +226,11 @@ pub trait SessionEngine: Send + Sync {
         let _ = path;
     }
 
+    /// Capture the worker-owned durable leaf before the current prompt rows
+    /// persist. Lazy engines restore model context only through this boundary;
+    /// admission supplies the current rows once. This must not build a session.
+    fn set_prompt_context_boundary(&self, _leaf_id: Option<String>) {}
+
     /// A session being revived restores the model its file pins before the
     /// startup chain, so it does not silently land on the startup-chain
     /// default. `saved` skips a second windowed open; `None` reads the file.
@@ -258,6 +263,7 @@ pub trait SessionEngine: Send + Sync {
     fn configure_startup_scope(
         &self,
         _scoped_models: Vec<pa_core::models::ScopedModel>,
+        _patterns: Vec<String>,
         _is_continuing: bool,
     ) {
     }
@@ -341,6 +347,16 @@ pub trait SessionEngine: Send + Sync {
     fn supported_thinking_levels(&self) -> Option<Vec<String>> {
         None
     }
+
+    /// The session's newest accepted progress note; engines without a note
+    /// store report `None`.
+    fn progress_note(&self) -> Option<String> {
+        None
+    }
+
+    /// Clears the stored note at the run boundary; engines without a note
+    /// store do nothing.
+    fn clear_progress_note(&self) {}
 
     /// The session's autonomous-run status snapshot (the accounting lock
     /// is async-held, hence the boxed future). The scripted harness reports `None`.

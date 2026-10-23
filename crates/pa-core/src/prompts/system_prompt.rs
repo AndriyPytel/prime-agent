@@ -60,21 +60,19 @@ pub struct SystemPromptBreakdown {
     pub cached_prefix_len: usize,
 }
 
-/// Inputs for one session's prompt. Static inputs (`custom_prompt`, `model`)
-/// select the cached prefix; everything else feeds the dynamic tail.
+/// Inputs for one session's prompt. Static inputs (`custom_prompt`,
+/// `model_prompt_extras`) select the cached prefix; everything else feeds
+/// the dynamic tail.
 #[derive(Debug, Default)]
 pub struct BuildSystemPromptOptions<'a> {
     /// Replaces the layered static prefix with user text. The dynamic tail
     /// still applies.
     pub custom_prompt: Option<String>,
-    /// Resolved model selector (`provider/id`), selecting per-model blocks.
-    pub model: Option<&'a str>,
+    pub model_prompt_extras: Option<&'a str>,
     /// Whether the resolved model accepts image input, when known.
     pub vision_capable: Option<bool>,
     /// Active tools. Tool schemas carry tool descriptions outside the prompt.
     pub selected_tools: Option<Vec<&'a str>>,
-    /// Additional guideline bullets appended to the dynamic tail.
-    pub prompt_guidelines: Option<Vec<String>>,
     pub append_system_prompt: Option<String>,
     pub cwd: String,
     /// Conversation log path.
@@ -88,6 +86,14 @@ pub struct BuildSystemPromptOptions<'a> {
     pub rlm_depth: Option<u32>,
     /// Human-readable parent name or id for child communication doctrine.
     pub rlm_parent_agent: Option<&'a str>,
+    /// Whether the session runs without a daemon (no scheduler, no
+    /// heartbeat firing). The wake-up facts the daemonless line states
+    /// must match the embedding's wiring.
+    pub daemonless: bool,
+    /// Whether `rlm.spawn` can create children in this session (the
+    /// daemonless print host or a daemon worker); a daemonless session
+    /// without one cannot spawn at all.
+    pub can_spawn: bool,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
 }
@@ -99,6 +105,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 }
 
 /// Build the system prompt with its per-layer breakdown.
+#[must_use]
 pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemPromptBreakdown {
     let mut segments: Vec<PromptSegment> = Vec::new();
 
@@ -127,12 +134,11 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
                 layers::layer_source("opinionated").unwrap_or_default(),
                 layers::OPINIONATED_LAYER.trim().to_string(),
             ));
-            let per_model = layers::per_model_text(options.model);
-            if !per_model.is_empty() {
+            if let Some(extras) = options.model_prompt_extras {
                 segments.push(PromptSegment::static_segment(
-                    "per-model",
-                    layers::layer_source("per-model").unwrap_or_default(),
-                    per_model.join("\n\n"),
+                    "model-prompts",
+                    layers::layer_source("model-prompts").unwrap_or_default(),
+                    extras.to_string(),
                 ));
             }
         }
@@ -149,8 +155,8 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     let tools: Vec<&str> = options
         .selected_tools
         .clone()
-        .unwrap_or_else(|| vec!["ipython"]);
-    let has_ipython = tools.contains(&"ipython");
+        .unwrap_or_else(|| vec![pa_types::ai::PYTHON_TOOL_NAME]);
+    let has_ipython = tools.contains(&pa_types::ai::PYTHON_TOOL_NAME);
     let has_file_access = has_ipython || tools.contains(&"bash");
 
     segments.push(PromptSegment::dynamic_segment(
@@ -205,19 +211,6 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
             "session-role",
             "RLM recursion state",
             role,
-        ));
-    }
-
-    let guidelines = options
-        .prompt_guidelines
-        .as_deref()
-        .map(format_prompt_guidelines)
-        .unwrap_or_default();
-    if !guidelines.is_empty() {
-        segments.push(PromptSegment::dynamic_segment(
-            "additional-guidance",
-            "prompt guidelines",
-            format!("# Additional Guidance\n\n{guidelines}"),
         ));
     }
 
@@ -303,9 +296,23 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
         "Recursive agent depth: {depth}{}",
         if depth == 0 { " (root)" } else { " (not root)" }
     )];
-    if !has_ipython {
+    if options.daemonless {
+        lines.push(if options.can_spawn {
+            "This session has no daemon: heartbeats never fire, and background `bash()` completions wake you with a queued `[bash-done]` turn; the run waits for live background commands and your subagents before it exits. Subagent replies and exit notices still wake you."
+                .to_string()
+        } else {
+            "This session has no daemon: `rlm.spawn` is unavailable, heartbeats never fire, and background `bash()` completions wake you with a queued `[bash-done]` turn."
+                .to_string()
+        });
+    }
+    if has_ipython {
         lines.push(
-            "This session has no Python REPL (`ipython` tool): the programmatic tools described above are unavailable here."
+            "`await bash(cmd)` waits at most `yield_after` seconds (`bash(cmd, yield_after=...)`, default 10, max 300; `None` uses the default, not an unbounded wait). If the command is still running, it returns a snapshot: `r.running` is True, `r.exit_code` is None, `r.output` is the output so far, and `r.handle` is the live handle. A completed result has `r.running` False and an integer `r.exit_code`. The command keeps running after a snapshot; end the turn and collect the final result on the `[bash-done]` notification."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "This session has no Python REPL (`python_repl` tool): the programmatic tools described above are unavailable here."
                 .to_string(),
         );
     }
@@ -346,18 +353,6 @@ fn today() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn format_prompt_guidelines(guidelines: &[String]) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let mut list = Vec::new();
-    for guideline in guidelines {
-        let normalized = guideline.trim();
-        if !normalized.is_empty() && seen.insert(normalized.to_string()) {
-            list.push(format!("- {normalized}"));
-        }
-    }
-    list.join("\n")
 }
 
 fn format_generic_mcp_guidance(servers: &[String]) -> String {
@@ -424,7 +419,6 @@ mod tests {
         BuildSystemPromptOptions {
             cwd: "/w".to_string(),
             messages_path: Some("/log.jsonl".to_string()),
-            model: Some("mock/mock-1"),
             skills: vec![
                 skill("web-search", Some("websearch")),
                 skill("refine", Some("refine")),
@@ -453,7 +447,12 @@ mod tests {
         );
         assert_eq!(
             &prompt[..breakdown.cached_prefix_len],
-            layers::static_prefix(Some("mock/mock-1"))
+            format!(
+                "{}\n\n{}\n\n{}",
+                layers::CORE_LAYER.trim(),
+                layers::USAGE_LAYER.trim(),
+                layers::OPINIONATED_LAYER.trim()
+            )
         );
         let tail = &prompt[breakdown.cached_prefix_len..];
         assert!(tail.contains("Working directory: /w"));
@@ -489,6 +488,7 @@ mod tests {
     fn custom_prompt_replaces_layers_keeps_tail() {
         let mut options = base_options();
         options.custom_prompt = Some("Be terse.".to_string());
+        options.model_prompt_extras = Some("Tier-2 guidance.");
         options.context_files = vec![("AGENTS.md".to_string(), "Rule one.".to_string())];
         let breakdown = system_prompt_breakdown(&options);
         let prompt = &breakdown.assembled;
@@ -498,13 +498,13 @@ mod tests {
         assert!(prompt.contains("Working directory: /w"));
         assert!(prompt.contains("Current date: "));
         assert!(!prompt.contains("# prime-agent harness"));
+        assert!(!prompt.contains("Tier-2 guidance."));
     }
 
     #[test]
-    fn mcp_and_guidelines_are_tail_segments() {
+    fn mcp_servers_are_a_tail_segment() {
         let mut options = base_options();
         options.generic_mcp_servers = vec!["t".to_string(), "t".to_string()];
-        options.prompt_guidelines = Some(vec!["be careful".to_string(), "be careful".to_string()]);
         let breakdown = system_prompt_breakdown(&options);
         let names: Vec<&str> = breakdown
             .segments
@@ -512,36 +512,40 @@ mod tests {
             .map(|segment| segment.name)
             .collect();
         assert!(names.contains(&"mcp-servers"));
-        assert!(names.contains(&"additional-guidance"));
         assert!(breakdown.assembled.contains("# Generic MCP Connections"));
         assert!(breakdown
             .assembled
             .contains("Enabled generic MCP servers: `t`."));
-        assert!(breakdown
-            .assembled
-            .contains("# Additional Guidance\n\n- be careful"));
     }
 
     #[test]
-    fn per_model_blocks_extend_the_cached_prefix() {
-        // The shipped map has no blocks, so a model-mapped block can only be
-        // verified through the parser; assert the composition contract here:
-        // any per-model text lands inside the cached prefix.
-        let breakdown = system_prompt_breakdown(&base_options());
-        let static_segments = breakdown
+    fn daemonless_line_drops_the_stale_no_wake_claim() {
+        // The line's one durable contract: it no longer tells daemonless
+        // agents that background completions never wake them.
+        let mut spawning = base_options();
+        spawning.daemonless = true;
+        spawning.can_spawn = true;
+        assert!(!build_system_prompt(&spawning).contains("completions do not wake you"));
+
+        let mut bare = base_options();
+        bare.daemonless = true;
+        assert!(!build_system_prompt(&bare).contains("completions do not wake you"));
+    }
+
+    #[test]
+    fn model_prompt_extras_form_the_last_static_segment() {
+        let mut options = base_options();
+        options.model_prompt_extras = Some("Tier-2 guidance.");
+        let breakdown = system_prompt_breakdown(&options);
+        let names: Vec<&str> = breakdown
             .segments
             .iter()
-            .filter(|segment| segment.kind == SegmentKind::Static);
-        for segment in static_segments {
-            assert_eq!(
-                breakdown
-                    .assembled
-                    .find(&segment.text)
-                    .map(|at| at < breakdown.cached_prefix_len),
-                Some(true),
-                "static segment {} sits inside the cached prefix",
-                segment.name
-            );
-        }
+            .map(|segment| segment.name)
+            .collect();
+        assert_eq!(
+            names[..5],
+            ["core", "usage", "opinionated", "model-prompts", "packages"],
+            "extras are the last static segment, directly before the dynamic tail"
+        );
     }
 }

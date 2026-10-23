@@ -15,6 +15,14 @@ impl AgentsViewMode {
     ) -> (Vec<Line>, Option<(usize, usize)>) {
         // The frame height feeds the page step (TS reads `ui.terminal.rows` live at key time).
         self.last_height = height;
+        if let Some(view) = self.shell_view.as_mut() {
+            view.set_viewport_rows(height);
+            self.click_rows.clear();
+            self.hover_row = None;
+            let mut lines = view.render(&self.theme, width, &self.keybindings);
+            lines.resize_with(height, Vec::new);
+            return (lines, None);
+        }
         let mut lines: Vec<Line> = Vec::new();
         // The splash counts agent-kind rows only — nested subagent and summary rows never
         // inflate the header.
@@ -95,9 +103,27 @@ impl AgentsViewMode {
             .flatten()
             .map(str::to_string);
         let notice_height = notice_panel.as_ref().map_or(0, Vec::len);
-        let list_rows = height.saturating_sub(lines.len() + 1 + notice_height);
+        // The catalog never truncates silently: while store files are still unfolded, the list
+        // ends with their count.
+        let unloaded = self.saved_more.as_ref().map(|more| {
+            let text = if self.query.trim().is_empty() {
+                format!(
+                    "{} older sessions not loaded \u{b7} scroll to load",
+                    more.remaining
+                )
+            } else {
+                format!("Searching {} older sessions\u{2026}", more.remaining)
+            };
+            pad_line(
+                vec![self.theme.fg(ThemeColor::Dim, truncate_text(&text, width))],
+                width,
+            )
+        });
+        let list_rows = height
+            .saturating_sub(lines.len() + 1 + notice_height + usize::from(unloaded.is_some()));
         let list_frame_row = lines.len();
         lines.extend(self.render_list(width, list_rows, list_frame_row));
+        lines.extend(unloaded);
         if let Some(panel) = notice_panel {
             lines.extend(panel);
         }
@@ -257,7 +283,11 @@ impl AgentsViewMode {
         enum DisplayItem<'a> {
             Spacer,
             Heading(Section),
+            ShellsHeading(usize),
             Row(usize, &'a AgentsViewRow),
+            /// One note line of the selected row's expansion; one item per
+            /// line so the viewport clips at line granularity.
+            Detail(Line),
         }
         // The click surface records this render's visible rows; the early exits below leave it
         // empty.
@@ -266,14 +296,19 @@ impl AgentsViewMode {
             return Vec::new();
         }
         if self.rows.is_empty() {
-            let text = if self.query.trim().is_empty() {
-                "No sessions yet."
-            } else {
-                "No sessions match your search."
+            let text = match (self.query.trim().is_empty(), self.scope_active) {
+                (false, _) => "No sessions match your search.",
+                (true, true) => "No subagents yet.",
+                (true, false) => "No sessions yet.",
             };
             return vec![vec![self.theme.fg(ThemeColor::Dim, text.to_string())]];
         }
         let layout = build_layout(&self.rows, width);
+        let mut note_details = self
+            .rows
+            .get(self.selected)
+            .map(|row| self.render_note_details(row, width))
+            .filter(|details| !details.is_empty());
         // Each non-empty section contributes a spacer (when not first), its heading, then its rows.
         let counts: Vec<(Section, usize)> = [Section::Running, Section::Idle, Section::Inactive]
             .into_iter()
@@ -291,6 +326,20 @@ impl AgentsViewMode {
         // While a query is active the list is a ranked picker: one flat, relevance-ordered run
         // of hits (per-row icons carry the status), not status section blocks.
         if self.query.trim().is_empty() {
+            let shells: Vec<(usize, &AgentsViewRow)> = self
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.kind == RowKind::PersistentShell)
+                .collect();
+            if !shells.is_empty() {
+                display.push(DisplayItem::ShellsHeading(shells.len()));
+                display.extend(
+                    shells
+                        .into_iter()
+                        .map(|(index, row)| DisplayItem::Row(index, row)),
+                );
+            }
             for (section, count) in &counts {
                 if *count == 0 {
                     continue;
@@ -306,16 +355,23 @@ impl AgentsViewMode {
                     }
                     if include {
                         display.push(DisplayItem::Row(index, row));
+                        if index == self.selected {
+                            if let Some(details) = note_details.take() {
+                                display.extend(details.into_iter().map(DisplayItem::Detail));
+                            }
+                        }
                     }
                 }
             }
         } else {
-            display.extend(
-                self.rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| DisplayItem::Row(index, row)),
-            );
+            for (index, row) in self.rows.iter().enumerate() {
+                display.push(DisplayItem::Row(index, row));
+                if index == self.selected {
+                    if let Some(details) = note_details.take() {
+                        display.extend(details.into_iter().map(DisplayItem::Detail));
+                    }
+                }
+            }
         }
         // The viewport: reserve the column header and its spacer, center the slice on the
         // selected row, clip the overflow — a re-sorting rebuild keeps the selection on-screen.
@@ -331,18 +387,46 @@ impl AgentsViewMode {
                 |item| matches!(item, DisplayItem::Row(_, row) if Some(row.identity.as_str()) == selected_identity),
             )
             .map_or(-1, |index| index as isize);
+        let detail_count = display
+            .iter()
+            .filter(|item| matches!(item, DisplayItem::Detail(_)))
+            .count() as isize;
+        let block_end = selected_display_index + detail_count;
         let anchor = selected_display_index - (visible_rows / 2) as isize;
         let upper = display.len() as isize - visible_rows as isize;
         let start = anchor.min(upper).max(0) as usize;
-        let show_leading = start > 0 && visible_rows > 1;
-        let show_trailing = start + visible_rows < display.len() && visible_rows > 2;
-        let content_rows = visible_rows - usize::from(show_leading) - usize::from(show_trailing);
-        let slice_start = if selected_display_index >= start as isize + content_rows as isize {
-            (selected_display_index + 1 - content_rows as isize) as usize
-        } else {
-            start
-        };
-        let slice_end = (slice_start + content_rows).min(display.len());
+        // The clip markers read the FINAL slice: the shift below can move
+        // the slice past the section heading of a top selection, and a
+        // hidden side must always paint its `...`. The markers' rows fold
+        // out of the row budget before the slice is placed, so the reserved
+        // rows and the painted `...` agree with what the slice actually
+        // hides — the markers only turn on as the budget shrinks, so the
+        // fold settles in a pass or two.
+        let mut show_leading = start > 0 && visible_rows > 1;
+        let mut show_trailing = start + visible_rows < display.len() && visible_rows > 2;
+        let mut content_rows =
+            visible_rows - usize::from(show_leading) - usize::from(show_trailing);
+        let mut slice_start;
+        let mut slice_end;
+        loop {
+            // Shift the window forward when the selected row's note block
+            // is taller than the anchored window: pin the block's tail to
+            // the window's bottom edge, never past the selected row.
+            slice_start = if block_end >= start as isize + content_rows as isize {
+                (block_end + 1 - content_rows as isize).min(selected_display_index) as usize
+            } else {
+                start
+            };
+            slice_end = (slice_start + content_rows).min(display.len());
+            let leading = slice_start > 0 && visible_rows > 1;
+            let trailing = slice_end < display.len() && visible_rows > 2;
+            if (leading, trailing) == (show_leading, show_trailing) {
+                break;
+            }
+            show_leading = leading;
+            show_trailing = trailing;
+            content_rows = visible_rows - usize::from(leading) - usize::from(trailing);
+        }
         // The viewport's front rows shift the session rows down — the click rows and the hover
         // band carry the shift.
         let shift = header_rows + usize::from(show_leading);
@@ -362,6 +446,12 @@ impl AgentsViewMode {
                         truncate_text(&format!("{} ({count})", section_title(*section)), width),
                     )]);
                 }
+                DisplayItem::ShellsHeading(count) => {
+                    lines.push(vec![self.theme.fg(
+                        ThemeColor::Muted,
+                        truncate_text(&format!("Persistent shells ({count})"), width),
+                    )]);
+                }
                 DisplayItem::Row(index, row) => {
                     // The row's frame position carries the hover (operator directive
                     // 2026-09-29): the light band rides the row the mouse rests on.
@@ -373,6 +463,9 @@ impl AgentsViewMode {
                     if row.selectable() {
                         click_rows.push((local, *index));
                     }
+                }
+                DisplayItem::Detail(detail) => {
+                    lines.push(detail.clone());
                 }
             }
         }
@@ -425,7 +518,7 @@ impl AgentsViewMode {
         let theme = &self.theme;
         // A muted, truncated program line on the tool-panel background; never selection-painted.
         if row.kind == RowKind::Code {
-            let text = format!("{}  {}", "  ".repeat(row.depth), row.title);
+            let text = format!("{}  {}", depth_indent(row.depth), row.title);
             let line = pad_line(
                 vec![theme.fg(ThemeColor::Muted, truncate_text(&text, width))],
                 width,
@@ -434,14 +527,23 @@ impl AgentsViewMode {
         }
         let selected = Some(row.identity.as_str())
             == self.rows.get(self.selected).map(|r| r.identity.as_str());
+        // The activity lines' glyph sits in the summary line's marker slot; no cost cell.
+        if matches!(row.kind, RowKind::Shells | RowKind::FactoryRuns) {
+            let text = format!("{}{}", depth_indent(row.depth), row.title);
+            let line = pad_line(vec![crate::Span::raw(truncate_text(&text, width))], width);
+            return finish_session_row(theme, line, selected, hovered, width);
+        }
         if row.kind == RowKind::SubagentSummary {
-            let indent = "  ".repeat(row.depth);
+            let indent = depth_indent(row.depth);
             let marker = if row.expanded { "\u{25be}" } else { "\u{25b8}" };
             let text = format!("{indent}{marker} {}", row.title);
             // BOTH summary lines bill the descendant tree in the Cost column (operator directive
             // 2026-09-26: an all-done tree renders no running line, so the inactive line carries
             // the same aggregate; deliberate divergence from TS, which renders no cost there).
-            if crate::agents_view_forest::is_summary_row_identity(&row.identity) {
+            if row
+                .identity
+                .starts_with(crate::agents_view_forest::SUMMARY_ROW_PREFIX)
+            {
                 let zone = layout.name_width + 2 + layout.model_width;
                 let title = crate::agents_view_state::truncate_text(&text, zone);
                 let pad = zone.saturating_sub(str_width(&title));
@@ -469,6 +571,7 @@ impl AgentsViewMode {
             return finish_session_row(theme, line, selected, hovered, width);
         }
         let icon = match row.section {
+            _ if row.kind == RowKind::PersistentShell => "$",
             Section::Running => ["\u{25c7}", "\u{25c8}", "\u{25c6}", "\u{25c8}"][self.pulse % 4],
             _ => "\u{2022}",
         };
@@ -480,7 +583,12 @@ impl AgentsViewMode {
         let icon_style = theme
             .fg_style(icon_color)
             .add_modifier(ratatui::style::Modifier::BOLD);
-        let indent = "  ".repeat(row.depth);
+        // The indent clips to the name column after the icon prefix, so a deep row keeps the
+        // model and cost/age columns in place.
+        let indent = truncate_text(
+            &depth_indent(row.depth),
+            layout.name_width.saturating_sub(2),
+        );
         let indent_width = str_width(&indent);
         let mut line: Line = Vec::new();
         if indent_width > 0 {
@@ -563,6 +671,39 @@ impl AgentsViewMode {
             .unwrap_or_default();
         line.push(theme.fg(ThemeColor::Dim, details));
         finish_session_row(theme, line, selected, hovered, width)
+    }
+
+    /// The selected agent/subagent row's progress note: wrapped,
+    /// indented to the title column, dim; other row kinds render nothing.
+    pub(super) fn render_note_details(&self, row: &AgentsViewRow, width: usize) -> Vec<Line> {
+        if width == 0 || !matches!(row.kind, RowKind::Agent | RowKind::Subagent) {
+            return Vec::new();
+        }
+        let Some(note) = row
+            .summary
+            .get("progressNote")
+            .and_then(Value::as_str)
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+        else {
+            return Vec::new();
+        };
+        // Keep room for a wide character when nesting exceeds the pane.
+        let indent_width = (str_width(&depth_indent(row.depth)) + 2).min(width.saturating_sub(2));
+        let indent = " ".repeat(indent_width);
+        let dim = self.theme.fg_style(ThemeColor::Dim);
+        let wrap_width = width.saturating_sub(str_width(&indent)).max(1);
+        crate::width::wrap_text(&note, wrap_width)
+            .into_iter()
+            .map(|mut wrapped| {
+                let mut out: Line = vec![crate::Span::styled(indent.clone(), dim)];
+                for span in wrapped.drain(..) {
+                    out.push(crate::Span::styled(span.content, dim));
+                }
+                // A one-column pane cannot contain a wide character.
+                crate::width::slice_line_by_column_strict(&out, 0, width, true)
+            })
+            .collect()
     }
 
     /// The bottom hint/status line. `status_override` carries the
@@ -754,6 +895,12 @@ pub(super) fn finish_session_row(
     line
 }
 
+/// Every row's leading indent: one step per nesting level, so a row's child lines sit a full
+/// step past its `• ` prefix.
+fn depth_indent(depth: usize) -> String {
+    " ".repeat(4 * depth)
+}
+
 pub(super) fn cell(value: &str, width: usize) -> String {
     let truncated = truncate_text(value, width);
     format!(
@@ -929,6 +1076,11 @@ impl Renderer {
                                     if ui_tx.send(UiInput::Mouse(event)).is_err() {
                                         return;
                                     }
+                                }
+                            }
+                            AgentsStep::Notify(notify) => {
+                                if ui_tx.send(UiInput::Notify(notify)).is_err() {
+                                    return;
                                 }
                             }
                         }

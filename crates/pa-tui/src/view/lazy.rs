@@ -7,7 +7,6 @@ use crate::chat::Detail;
 /// immediately; only a resumed session's pad-scale row sets cross this.
 const HUGE_PACKED_ROWS: usize = 8192;
 
-use crate::chrome::render_splash;
 use crate::Line;
 
 #[cfg(test)]
@@ -121,6 +120,136 @@ impl AgentView {
         self.sparse_window = Some(window);
     }
 
+    pub(super) fn reanchor_paused_window_for_prepend(&mut self) {
+        let Some(mut window) = self.sparse_window.take() else {
+            if !self.following && self.layout_width > 0 && !self.chat.is_empty() {
+                let sparse = self.sparse_enabled;
+                let old_rows = self.layout_pass(self.layout_width).total;
+                self.sparse_enabled = sparse;
+                if self.has_selection() {
+                    self.rebase_top_selection_to_tail(old_rows);
+                }
+                let distance = old_rows
+                    .saturating_sub(self.scroll_top)
+                    .saturating_sub(self.window_rows);
+                self.sparse_window = Some(SparseWindow {
+                    anchor: Anchor::Tail(distance),
+                    detail: self.detail,
+                    width: self.layout_width,
+                    visible_rows: 0,
+                    cursor: None,
+                    pending: 0,
+                });
+            }
+            return;
+        };
+        let Anchor::Top(offset) = window.anchor else {
+            self.sparse_window = Some(window);
+            return;
+        };
+        let sparse = self.sparse_enabled;
+        let old_rows = self.layout_pass(self.layout_width).total;
+        self.sparse_enabled = sparse;
+        if self.has_selection() {
+            self.rebase_top_selection_to_tail(old_rows);
+        }
+        window.anchor = Anchor::Tail(
+            old_rows
+                .saturating_sub(offset)
+                .saturating_sub(self.window_rows),
+        );
+        self.sparse_window = Some(window);
+    }
+
+    /// A spacing-driven cursor can look past hidden assistant entries to the
+    /// prepended head, even when it is not on the first entry. Only its leading
+    /// blank can change; preserve the content row without measuring the history.
+    pub(super) fn prepend_cursor_spacing(&self, prepended: usize) -> Option<bool> {
+        let (section, _) = self.sparse_window?.cursor?;
+        let index = section.checked_sub(1)? + prepended;
+        matches!(
+            self.chat.get(index)?,
+            crate::chat::ChatEntry::Tool(_)
+                | crate::chat::ChatEntry::AgentMessage(_)
+                | crate::chat::ChatEntry::ShellCompletion(_)
+        )
+        .then(|| self.conversation_leading(index, self.entry_detail(index).tool_output_expanded()))
+    }
+
+    pub(super) fn note_prepended_entries(
+        &mut self,
+        count: usize,
+        seam_before: usize,
+        cursor_spacing_before: Option<bool>,
+    ) {
+        if self.layout_width == 0 {
+            return;
+        }
+        let cursor_spacing_after = self.prepend_cursor_spacing(count);
+        let Some(mut window) = self.sparse_window.take() else {
+            return;
+        };
+        let seam_after = if self.chat.len() > count {
+            self.count_entry_rows(count, self.layout_width)
+        } else {
+            0
+        };
+        window.cursor = match window.cursor.take() {
+            Some((0, _)) if self.chat.len() > count => {
+                Some((count + 1, seam_after.saturating_sub(seam_before)))
+            }
+            Some((0, row)) => Some((0, row)),
+            Some((1, row)) if self.chat.len() > count => {
+                Some((count + 1, (row + seam_after).saturating_sub(seam_before)))
+            }
+            Some((section, row)) => {
+                let row = match cursor_spacing_before.zip(cursor_spacing_after) {
+                    Some((before, after)) => {
+                        (row + usize::from(after)).saturating_sub(usize::from(before))
+                    }
+                    None => row,
+                };
+                Some((section + count, row))
+            }
+            None => None,
+        };
+        self.sparse_window = Some(window);
+    }
+
+    /// The chat entry and its row at the top of a paused viewport; `None` while following or
+    /// when the top is the splash or the tail section.
+    pub(crate) fn reader_position(&self) -> Option<(usize, usize)> {
+        if self.following {
+            return None;
+        }
+        let (section, row) = self.sparse_window?.cursor?;
+        (1..=self.chat.len())
+            .contains(&section)
+            .then(|| (section - 1, row))
+    }
+
+    /// Pause the viewport with row `row` of entry `index` at its top.
+    pub(crate) fn scroll_to_entry(&mut self, index: usize, row: usize) {
+        if self.layout_width == 0 {
+            return;
+        }
+        let sparse = self.sparse_enabled;
+        let offset = self.layout_pass(self.layout_width).entry_start(index) + row;
+        self.sparse_enabled = sparse;
+        self.sparse_window = None;
+        self.scroll_top = offset;
+        self.following = false;
+    }
+
+    /// `count` leading entries above the window dropped: the cursor's entry moved up.
+    pub(super) fn note_dropped_entries(&mut self, count: usize) {
+        if let Some(window) = &mut self.sparse_window {
+            window.cursor = window.cursor.and_then(|(section, row)| {
+                Some((section.checked_sub(count).filter(|s| *s > 0)?, row))
+            });
+        }
+    }
+
     /// The delta of a just-appended entry, countable because the push
     /// landed.
     pub(super) fn sparse_note_append(&mut self) {
@@ -172,13 +301,9 @@ impl AgentView {
                 let splash = splash.get_or_insert_with(|| {
                     #[cfg(test)]
                     SPLASH_RENDERS.with(|count| count.set(count.get() + 1));
-                    // The suppressed splash is an empty section: the sparse walker skips
-                    // zero-row sections like an empty tail.
-                    if view.splash_suppressed {
-                        std::sync::Arc::new(Vec::new())
-                    } else {
-                        std::sync::Arc::new(render_splash(&view.chrome, &view.theme, window.width))
-                    }
+                    // An empty top section: the sparse walker skips zero-row sections like an
+                    // empty tail.
+                    std::sync::Arc::new(view.top_section_rows(window.width))
                 });
                 EntryRows::Fresh(splash.clone())
             } else if section == last {
@@ -356,13 +481,9 @@ impl AgentView {
                 let splash = splash.get_or_insert_with(|| {
                     #[cfg(test)]
                     SPLASH_RENDERS.with(|count| count.set(count.get() + 1));
-                    // The suppressed splash is an empty section: the sparse walker skips
-                    // zero-row sections like an empty tail.
-                    if view.splash_suppressed {
-                        std::sync::Arc::new(Vec::new())
-                    } else {
-                        std::sync::Arc::new(render_splash(&view.chrome, &view.theme, width))
-                    }
+                    // An empty top section: the sparse walker skips zero-row sections like an
+                    // empty tail.
+                    std::sync::Arc::new(view.top_section_rows(width))
                 });
                 return EntryRows::Fresh(splash.clone());
             }
