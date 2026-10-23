@@ -745,10 +745,10 @@ fn acp_prompt_chunk_carries_the_assistant_message_id() {
         .iter()
         .find(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
         .expect("a message chunk");
-    assert_eq!(
-        chunk["params"]["update"]["messageId"],
-        "prime-agent-assistant-1"
-    );
+    let message_id = chunk["params"]["update"]["messageId"]
+        .as_str()
+        .expect("message id");
+    assert!(message_id.starts_with("prime-agent-assistant-") && message_id.ends_with("-1"));
     assert_eq!(
         chunk["params"]["update"]["content"],
         json!({ "type": "text", "text": "ACP-OK" })
@@ -1566,10 +1566,10 @@ fn acp_daemon_attached_close_ends_the_owned_worker_and_new_hosts_a_fresh_one() {
         .find(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
         .expect("a message chunk");
     // The event mapping restarts with the session, like TS.
-    assert_eq!(
-        chunk["params"]["update"]["messageId"],
-        "prime-agent-assistant-1"
-    );
+    let message_id = chunk["params"]["update"]["messageId"]
+        .as_str()
+        .expect("message id");
+    assert!(message_id.starts_with("prime-agent-assistant-") && message_id.ends_with("-1"));
     let sessions = live_sessions(&socket);
     assert!(
         sessions

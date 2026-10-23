@@ -19,8 +19,11 @@ use super::types::{AcpSessionUpdate, AcpToolKind, AcpToolStatus, TextBlock, Tool
 /// Correlates streamed chunks with their owning assistant message (the
 /// daemon stream carries the delta on `assistantMessageEvent`) and bash
 /// output chunks with the run that produced them.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WireMappingState {
+    /// Air appends a chunk to any earlier message with the same id, so ids
+    /// must not repeat across ACP processes.
+    process_token: String,
     next_assistant_message_sequence: u64,
     active_assistant_message_id: Option<String>,
     active_bash_run_id: Option<String>,
@@ -33,12 +36,28 @@ pub struct WireMappingState {
     pub air: bool,
 }
 
+impl Default for WireMappingState {
+    fn default() -> Self {
+        Self {
+            process_token: uuid::Uuid::new_v4().simple().to_string(),
+            next_assistant_message_sequence: 0,
+            active_assistant_message_id: None,
+            active_bash_run_id: None,
+            ipython_cells: HashMap::new(),
+            ipython_output: HashMap::new(),
+            last_child_info: HashMap::new(),
+            streaming: false,
+            air: false,
+        }
+    }
+}
+
 impl WireMappingState {
     fn start_assistant_message(&mut self) -> String {
         self.next_assistant_message_sequence += 1;
         let id = format!(
-            "prime-agent-assistant-{}",
-            self.next_assistant_message_sequence
+            "prime-agent-assistant-{}-{}",
+            self.process_token, self.next_assistant_message_sequence
         );
         self.active_assistant_message_id = Some(id.clone());
         id
@@ -1389,7 +1408,8 @@ mod tests {
         wire_updates(&start, &mut air);
         let updates = wire_updates(&end("stop", "answer"), &mut air);
         let chunk = updates[0].to_bare_value();
-        assert_eq!(chunk["messageId"], "prime-agent-assistant-1");
+        let id = chunk["messageId"].as_str().expect("message id");
+        assert!(id.starts_with("prime-agent-assistant-") && id.ends_with("-1"));
         assert_eq!(chunk["content"]["text"], "");
         assert_eq!(chunk["_meta"]["jetbrains"]["air"]["phase"], "final_answer");
         wire_updates(&start, &mut air);
@@ -1400,6 +1420,17 @@ mod tests {
         let mut plain = WireMappingState::default();
         wire_updates(&start, &mut plain);
         assert!(wire_updates(&end("stop", "answer"), &mut plain).is_empty());
+    }
+
+    #[test]
+    fn a_restarted_process_never_reuses_an_assistant_message_id() {
+        let start = json!({ "type": "message_start", "message": { "role": "assistant" } });
+        let first_id = || {
+            let mut state = WireMappingState::default();
+            wire_updates(&start, &mut state);
+            state.message_started()
+        };
+        assert_ne!(first_id(), first_id());
     }
 
     #[test]
@@ -1418,8 +1449,9 @@ mod tests {
         };
         let thought = wire_updates(&delta("thinking_delta"), &mut state)[0].to_bare_value();
         let text = wire_updates(&delta("text_delta"), &mut state)[0].to_bare_value();
-        assert_eq!(thought["messageId"], "prime-agent-assistant-1-thought");
-        assert_eq!(text["messageId"], "prime-agent-assistant-1");
+        let text_id = text["messageId"].as_str().expect("message id");
+        assert!(text_id.starts_with("prime-agent-assistant-") && text_id.ends_with("-1"));
+        assert_eq!(thought["messageId"], format!("{text_id}-thought"));
     }
 
     #[test]
