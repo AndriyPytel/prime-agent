@@ -29,6 +29,31 @@ One session per connection is a deliberate limit: Prime Agent's underlying sessi
 
 Likewise `session/prompt` refuses a concurrent turn while one is running, and the working directory cannot be changed after startup — a client-supplied `cwd` that differs from the agent's real one is reported back in `_meta` rather than silently ignored.
 
+<<<<<<< HEAD
+## MCP servers
+
+Prime Agent accepts standard stdio and HTTP servers in `session/new.mcpServers`. The servers are
+available through the pre-imported `mcp` Python program for that ACP session:
+
+```python
+tools = await mcp.list_tools("task-tools")
+result = await mcp.call_tool("task-tools", "lookup", {"query": "example"})
+```
+
+HTTP requests use only the URL and headers supplied by the ACP client. They do not read
+`auth.json`, start or refresh Prime Agent OAuth, or modify persistent MCP settings. Stdio servers
+run with the agent's actual session cwd, the supplied command and arguments, a scrubbed base
+environment, and the exact environment values supplied by the ACP client.
+
+The configuration is removed when the ACP session closes or the client disconnects. A same-named
+persistent MCP server can therefore be shadowed for the ACP session without sending its stored
+OAuth credential to the client-supplied HTTP endpoint. Daemon-backed configuration is bound to the
+ACP connection that installed it, so another attached client cannot replace or clear it.
+
+ACP stdio is a trusted-code boundary, not a sandbox. The requested command runs as the Prime Agent
+user and can access any files that user can access, including credential stores. Only accept stdio
+servers from trusted ACP clients or run Prime Agent inside an appropriate sandbox.
+=======
 ## Model selection
 
 `session/new` returns a `model` [session config option](https://agentclientprotocol.com/protocol/session-config-options) — an ACP `select` in the `model` category — so a client can render a model picker:
@@ -47,6 +72,7 @@ Likewise `session/prompt` refuses a concurrent turn while one is running, and th
 Values are the canonical `provider/id` reference, since the same model id is served by more than one provider. `session/set_config_option` switches the model and answers with the complete configuration state.
 
 Only models with configured credentials are offered. The TUI lists the rest and starts a sign-in when one is picked; ACP has no sign-in flow, so an unauthenticated model would be a choice that only fails at the next prompt.
+>>>>>>> 87ce76424 (feat(acp): add model picker to ACP mode)
 
 ## Streamed updates
 
@@ -67,11 +93,12 @@ After `session/new`, one `available_commands_update` lists the commands a prompt
 
 Each name appears once, resolved the way a submitted command is: a session builtin first, then an extension command, then a skill, then a prompt template. The list is an initial snapshot; ACP has no method to reload resources, and a reload from elsewhere raises no session event, so nothing can invalidate it for the life of the connection.
 
-IPython is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `execute` whose `rawInput` carries the cell source. The call is titled by the cell's first meaningful line, and the source also travels as a fenced content block for clients that render content rather than `rawInput`. Both treat the cell as untrusted text: the fence outruns the longest backtick run in the source, and control characters and bidi overrides are stripped from the title.
+The Python REPL is Prime Agent's model-facing tool, so a cell is a `tool_call` of kind `other` whose `rawInput` carries the cell source. The kind is deliberately not `execute`: a client that renders that kind as a terminal block drops the source once the call completes and falls back to a truncated `rawInput.command`, which a cell never carries. Output is streamed into the same call: every chunk republishes the cell and everything printed so far as fenced content blocks, so a long-running cell is readable while it runs and stays readable after it ends. The call is titled by the cell's first meaningful line, and the source also travels as a fenced content block for clients that render content rather than `rawInput`. Both treat the cell as untrusted text: the fence outruns the longest backtick run in the source, and control characters and bidi overrides are stripped from the title.
+>>>>>>> c136b7f8a (fix(acp): advertise one command per name, in submission order)
 
 ## Prime Agent extensions
 
-Prime Agent has capabilities ACP has no field for: subagents, autonomous quality gates, goals, heartbeats, continual-harness refinement, compaction, and rich IPython output. These travel in a reverse-domain `_meta` envelope:
+Prime Agent has capabilities ACP has no field for: subagents, autonomous quality gates, goals, heartbeats, continual-harness refinement, compaction, and rich kernel output. These travel in a reverse-domain `_meta` envelope:
 
 ```json
 {

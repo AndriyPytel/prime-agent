@@ -1,6 +1,6 @@
 {
   "name": "prime-agent-core",
-  "version": "0.7.4-apytel.1",
+  "version": "0.9.1-apytel.1",
   "description": "General-purpose agent with transport abstraction, state management, and attachment support",
   "type": "module",
   "main": "./dist/index.js",
@@ -10,7 +10,7 @@
     "README.md"
   ],
   "dependencies": {
-    "@earendil-works/pi-ai": "https://local.invalid/releases/v0.7.4-apytel.1/prime-agent-ai-0.7.4-apytel.1.tgz",
+    "@earendil-works/pi-ai": "file:///Users/apytel/Projects/prime-agent-wt/rebase-091/packages/coding-agent/release/artifacts/releases/v0.9.1-apytel.1/prime-agent-ai-0.9.1-apytel.1.tgz",
     "typebox": "^1.3.9"
   },
   "keywords": [
