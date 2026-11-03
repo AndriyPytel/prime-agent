@@ -461,10 +461,18 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
         let host = hosts.lock().unwrap().get(&session_id).cloned();
         let Some(host) = host else {
             if let Incoming::Request { id, .. } = &incoming {
-                let _ = tx.send(super::internal_error(
-                    id,
-                    &format!("Unknown ACP session: {session_id}"),
-                ));
+                let reason = format!("Unknown ACP session: {session_id}");
+                // TS refuses a config change for an unknown session as invalid params.
+                let _ = tx.send(if method == "session/set_config_option" {
+                    jsonrpc::error_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        "Invalid params",
+                        Some(&json!({ "reason": reason })),
+                    )
+                } else {
+                    super::internal_error(id, &reason)
+                });
             }
             continue;
         };
