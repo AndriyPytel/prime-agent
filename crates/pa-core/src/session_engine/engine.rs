@@ -270,6 +270,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // factory host bridge's preflight facts (the daemon `allowedModels`
     // pin), like the request-timing snapshot above.
     let factory_allowed_models = settings.get_allowed_models();
+    // Captured before `settings` moves into the resource loader: the
+    // per-cell watchdog budget (default 60s, `0` disables).
+    let python_cell_timeout_ms = settings.get_python_cell_timeout_ms();
     let (mcp_skill_overrides, mcp_generic_servers, built_manager) =
         mcp_gating(&settings, config.agent_dir.clone()).await?;
     let mcp_manager = config
@@ -486,8 +489,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         .await
         .map_err(|join| anyhow::anyhow!("websearch key resolve join failed: {join}"))?
     };
+    // The per-cell watchdog: daemon-backed sessions arm the settings budget
+    // (default 60s, `0` disables); daemonless sessions keep `await bash()`
+    // unbounded by design (#3523), so their cells are never annotated.
+    let cell_timeout_ms =
+        super::runtime_wiring::arm_cell_timeout_ms(config.daemonless, python_cell_timeout_ms);
     let provisioner = super::runtime_wiring::kernel_provisioner(
-        session_id,
+        session_id.clone(),
         handlers,
         python_skills.clone(),
         cwd.clone(),
@@ -496,6 +504,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         kernel_command_prefix,
         serper_api_key,
         session_artifact_dir,
+        cell_timeout_ms,
         on_restore,
         config.on_background_work_settled.clone(),
         on_unavailable_skills,
@@ -688,6 +697,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         None => timing_stream_fn,
     };
     let agent = Agent::new(AgentOptions {
+        // Every request in the session carries this identity: providers key prompt caching
+        // (`prompt_cache_key`), session headers, and WebSocket/`previous_response_id` reuse on it
+        // (TS `sdk.ts` passes `sessionManager.getSessionId()`).
+        session_id: Some(session_id),
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
             model: Some(model),
@@ -1014,7 +1027,13 @@ impl SessionEngine {
 
     /// Tear the kernel down now with a final namespace snapshot, for a host that
     /// ends the session but keeps the engine alive; dropping the engine tears the kernel down too.
+    /// The session's cached Codex WebSocket closes with it (TS `cleanupSessionResources` on
+    /// dispose), so a worker that replaces its session does not hold the old socket until the
+    /// idle expiry.
     pub async fn dispose_kernel(&self) {
+        if let Some(session_id) = self.session.agent().session_id() {
+            pa_ai::codex_debug::close_websocket_sessions(Some(session_id));
+        }
         self.provisioner.dispose(None).await;
     }
 

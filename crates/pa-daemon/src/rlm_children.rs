@@ -198,6 +198,13 @@ struct ChildRecord {
     /// The parent session closed while this child ran: the settle watcher
     /// exits without a notice — none is owed to a session being torn down.
     closed_by_parent: bool,
+    /// A parent delete is in flight for this child: a settle watcher that
+    /// wakes inside the kill window must not record a clean
+    /// `child_returned` (the delete records a cancel edge instead). Kept
+    /// apart from `settled_status` so the live run is never faked settled:
+    /// the watcher stays alive and the row stays correctly reported, which
+    /// also lets a failed kill simply clear the mark.
+    retiring: bool,
     /// Confirmed retirement completed its roster, notice and settle bookkeeping.
     retirement_finished: bool,
     /// Claim the synchronous delete notifier once across interrupted retirement retries.
@@ -360,6 +367,13 @@ enum RetirementIntent {
     Close,
 }
 
+/// The parent worker's turn state as the detached child prompt tasks read it.
+#[derive(Debug, Clone, Copy, Default)]
+struct ParentTurn {
+    completed: u64,
+    running: bool,
+}
+
 #[derive(Clone)]
 struct RetiredChild {
     record: Arc<Mutex<ChildRecord>>,
@@ -391,9 +405,9 @@ struct SupervisorChildSessionsInner {
     /// Delete-receipt tombstones: a deleted child's identity stays behind
     /// the registry so `collect` answers a just-deleted selector.
     deleted_children: std::sync::Mutex<std::collections::HashMap<String, DeletedChild>>,
-    /// Bumped once per completed parent turn: mid-turn prompt tasks wait for the next bump (the
-    /// continuation is in flight before the child's first model turn).
-    turn_done: tokio::sync::watch::Sender<u64>,
+    /// The parent worker's turn boundary: prompt tasks spawned mid-turn wait for that turn to
+    /// complete (the continuation is in flight before the child's first model turn).
+    parent_turn: tokio::sync::watch::Sender<ParentTurn>,
     /// The parent engine's child-settle hook (goal continuation resume).
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Whether any tracked child run is unsettled (the `any_running`
@@ -460,7 +474,7 @@ impl SupervisorChildSessions {
                 retired_usage: std::sync::Mutex::new(Vec::new()),
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
-                turn_done: tokio::sync::watch::Sender::new(0),
+                parent_turn: tokio::sync::watch::Sender::new(ParentTurn::default()),
                 settle_hook: std::sync::Mutex::new(None),
                 running: tokio::sync::watch::Sender::new(false),
                 settle_notify: tokio::sync::Notify::new(),
@@ -494,10 +508,21 @@ impl SupervisorChildSessions {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
     }
 
+    /// The worker started a parent turn: spawns admitted from here on hold
+    /// their task prompt until the turn completes.
+    pub fn notify_turn_started(&self) {
+        self.inner
+            .parent_turn
+            .send_modify(|turn| turn.running = true);
+    }
+
     /// The worker saw the parent's turn end: release prompt tasks waiting
     /// on the boundary (called once per `EngineEvent::Done`).
     pub fn notify_turn_done(&self) {
-        self.inner.turn_done.send_modify(|value| *value += 1);
+        self.inner.parent_turn.send_modify(|turn| {
+            turn.completed += 1;
+            turn.running = false;
+        });
     }
 
     /// Register the child-settle hook: fired once per settled child run
@@ -702,14 +727,23 @@ impl SupervisorChildSessions {
     /// registry).
     #[cfg(test)]
     pub(crate) async fn settle_test_child(&self, child_active_session_id: &str) {
-        let children = self.inner.children.lock().await;
-        for record in children.iter() {
-            let mut record = record.lock().await;
-            if record.active_session_id == child_active_session_id {
-                record.settled_status = Some("done");
-                // The settle funnel's flag: the quiescence predicate reads it, not
-                // the terminal status.
-                record.settled = true;
+        let children = self.inner.children.lock().await.clone();
+        for record in children {
+            let matched = {
+                let mut record = record.lock().await;
+                let matched = record.active_session_id == child_active_session_id;
+                if matched {
+                    record.settled_status = Some("done");
+                    // The settle funnel's flag: the quiescence predicate reads it, not
+                    // the terminal status.
+                    record.settled = true;
+                }
+                matched
+            };
+            if matched {
+                // The settle FUNNEL, not just the flags: the goal
+                // continuation is released by the hook a real settle fires.
+                self.inner.fire_settle_hook(&record).await;
             }
         }
     }
@@ -745,6 +779,7 @@ impl SupervisorChildSessions {
                 prompt_admitted: true,
                 error: None,
                 closed_by_parent: false,
+                retiring: false,
                 retirement_finished: false,
                 retirement_notified: false,
                 retirement_roster_emitted: false,
@@ -1025,10 +1060,10 @@ impl SupervisorChildSessionsInner {
     /// strictly greater than the one captured at spawn admission). Bounded:
     /// a turn that never settles releases the child anyway.
     pub async fn wait_turn_done(&self, generation: u64) {
-        let mut receiver = self.turn_done.subscribe();
+        let mut receiver = self.parent_turn.subscribe();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
-            receiver.wait_for(|value| *value > generation),
+            receiver.wait_for(|turn| turn.completed > generation),
         )
         .await;
     }

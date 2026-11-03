@@ -173,6 +173,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     prompt_admitted: false,
                     error: None,
                     closed_by_parent: false,
+                    retiring: false,
                     retirement_finished: false,
                     retirement_notified: false,
                     retirement_roster_emitted: false,
@@ -238,12 +239,20 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             let child_log_id = child_id.clone();
-            // Capture the current turn boundary before detaching: spawn
-            // admission happens mid-turn, so the parent's continuation
-            // request reaches the provider first (see `wait_turn_done`).
-            let turn_generation = *this.turn_done.subscribe().borrow();
+            // Capture the spawning turn before detaching: a spawn admitted
+            // mid-turn prompts after that turn completes, so the parent's
+            // continuation request reaches the provider first (see
+            // `wait_turn_done`). A spawn admitted while the parent is idle
+            // (a background kernel task, e.g. a factory run) has no turn
+            // to wait for.
+            let spawning_turn = {
+                let turn = *this.parent_turn.borrow();
+                turn.running.then_some(turn.completed)
+            };
             tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
+                if let Some(generation) = spawning_turn {
+                    watcher_this.wait_turn_done(generation).await;
+                }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.
@@ -506,14 +515,37 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 ]),
             };
             drop(record_guard);
-            let was_running = record.lock().await.settled_status.is_none();
+            let was_running = {
+                // A delete of a LIVE run must not let a settle watcher that
+                // wakes inside the kill window append a clean
+                // `child_returned` beside the cancel line. The gate is this
+                // mark, not a fake settle: a fake settle would make the
+                // watcher treat the live run as finished and exit, which a
+                // failed kill would then strand (a live, unwatched child).
+                // A settled child's delete records no cancel line, so it
+                // leaves its return alone.
+                let mut row = record.lock().await;
+                let was_running = row.settled_status.is_none();
+                if was_running {
+                    row.retiring = true;
+                }
+                was_running
+            };
             // Capture before the kill: a deleted running child's durable
             // rows are its last observable spend on the parent side.
             if !already_terminated {
                 this.emit_child_usage(&record).await;
-                this.command(&command, KILL_TIMEOUT_MS)
+                if let Err(error) = this
+                    .command(&command, KILL_TIMEOUT_MS)
                     .await
-                    .with_context(|| format!("kill RLM child \"{target}\""))?;
+                    .with_context(|| format!("kill RLM child \"{target}\""))
+                {
+                    // The kill never landed: clear the mark so the
+                    // still-live child stays watchable and a later cancel
+                    // can still record the parent -> child edge.
+                    record.lock().await.retiring = false;
+                    return Err(error);
+                }
                 this.retain_retired_usage(&record, super::RetirementIntent::Delete { was_running });
                 // Observe any rows that landed before the acknowledged kill.
                 this.emit_child_usage(&record).await;

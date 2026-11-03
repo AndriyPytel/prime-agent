@@ -2108,7 +2108,11 @@ async fn prompt_turn(
         Err(error) => {
             publish_error_boundary(&producer, turn_id).await;
             producer.finish_prompt(turn_id).await;
-            return super::internal_error(&id, &error.to_string());
+            // The lost supervisor link (route timeout, worker loss) is
+            // classified like every other failed-prompt arm: typed data,
+            // never retryable at the boundary — the turn's outcome is
+            // unknown, so a host retry may re-run side-effecting tools.
+            return super::turn_failure_error(&id, &error.to_string(), &error.to_string());
         }
     };
     // TS `abort.signal.aborted` after `promptAndWait`: every turn frame
@@ -2135,7 +2139,14 @@ async fn prompt_turn(
         eprintln!("pa-daemon: acp turn failed: {failure}");
         publish_error_boundary(&producer, turn_id).await;
         producer.finish_prompt(turn_id).await;
-        return super::internal_error(&id, &format!("prime-agent turn failed: {failure}"));
+        // The worker's failure text classifies into the #200 host
+        // contract (the raw text still never rides past `details`), so
+        // the reply data is machine-readable at the transport boundary.
+        return super::turn_failure_error(
+            &id,
+            &failure,
+            &format!("prime-agent turn failed: {failure}"),
+        );
     }
     // The autonomous accounting for the completion envelope: the daemon's
     // headless-completion status (TS `waitForHeadlessCompletion`), fetched
@@ -2157,13 +2168,14 @@ async fn prompt_turn(
     }
     // The completion observation's roster read (TS `getRlmChildSnapshots`
     // throws): a failed read errors the prompt before the boundary, never
-    // publishes a wrong count.
+    // publishes a wrong count — with the same typed data as every other
+    // failed-prompt arm.
     let children = match fetch_rlm_children(link, &hosted_daemon_session_id).await {
         Ok(children) => children,
         Err(error) => {
             publish_error_boundary(&producer, turn_id).await;
             producer.finish_prompt(turn_id).await;
-            return super::internal_error(&id, &error.to_string());
+            return super::turn_failure_error(&id, &error.to_string(), &error.to_string());
         }
     };
     if turn_cancelled(&*state.lock().await, admission_id) {
@@ -2234,8 +2246,8 @@ async fn prompt_turn(
             }
             match joined {
                 Ok(SettleOutcome::Settled(status)) => Some(*status),
-                Ok(SettleOutcome::Failed(message)) => {
-                    return super::internal_error(&id, &message);
+                Ok(SettleOutcome::Failed { failure, details }) => {
+                    return super::turn_failure_error(&id, &failure, &details);
                 }
                 Ok(SettleOutcome::Cancelled) | Err(_) => return cancelled_response(&id),
             }
@@ -2278,7 +2290,7 @@ const PROMPT_SETTLE_GRACE: Duration = Duration::from_secs(3);
 enum SettleOutcome {
     Settled(Box<pa_core::autonomous::AgentAutonomousStatus>),
     Cancelled,
-    Failed(String),
+    Failed { failure: String, details: String },
 }
 
 async fn settle_terminal(
@@ -2290,8 +2302,9 @@ async fn settle_terminal(
     turn_id: u64,
     boundary_published: bool,
 ) -> SettleOutcome {
-    let reconciliation_failed = |error: anyhow::Error| {
-        SettleOutcome::Failed(format!("ACP lifecycle reconciliation failed: {error}"))
+    let reconciliation_failed = |error: anyhow::Error| SettleOutcome::Failed {
+        failure: error.to_string(),
+        details: format!("ACP lifecycle reconciliation failed: {error}"),
     };
     loop {
         let status = match fetch_autonomous_status(&link, &daemon_session_id, true).await {
@@ -2340,7 +2353,10 @@ async fn settle_terminal(
             )
             .await;
         if !boundary_published || !terminal_published {
-            return SettleOutcome::Failed("Failed to publish ACP completion".to_string());
+            return SettleOutcome::Failed {
+                failure: "Failed to publish ACP completion".to_string(),
+                details: "Failed to publish ACP completion".to_string(),
+            };
         }
         return SettleOutcome::Settled(Box::new(status));
     }
