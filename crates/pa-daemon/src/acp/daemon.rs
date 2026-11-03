@@ -2504,14 +2504,14 @@ fn changes_context_usage(event: &Value) -> bool {
     }
 }
 
-fn usage_update(state: &Value, stats: Option<&Value>) -> Option<types::AcpSessionUpdate> {
+fn usage_update(state: &Value, session_stats: Option<&Value>) -> Option<types::AcpSessionUpdate> {
     let usage = state.get("contextUsage")?;
     let used = usage.get("tokens")?.as_u64()?;
     let size = usage
         .get("contextWindow")?
         .as_u64()
         .filter(|size| *size > 0)?;
-    let cost = stats
+    let cost = session_stats
         .and_then(|stats| stats.get("cost"))
         .and_then(Value::as_f64)
         .map(|amount| types::UsageCost {
