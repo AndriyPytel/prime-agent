@@ -174,7 +174,7 @@ impl TurnRunner {
     /// fresh-snapshot fence — so this window only decides whether to
     /// arm.
     pub(super) fn idle_passivation_window(&self) -> Option<std::time::Duration> {
-        let (attached, compacting, shutdown, queued, last_activity, cwd) = {
+        let (attached, compacting, shutdown, queued, last_activity, cwd, unload) = {
             let core = self.core.lock().unwrap();
             (
                 core.attached_client_ids.is_empty(),
@@ -191,6 +191,7 @@ impl TurnRunner {
                     || self.input_pauses.paused(),
                 core.last_activity_ms,
                 core.cwd.clone(),
+                core.unload_when_detached,
             )
         };
         if !attached || compacting || shutdown || queued {
@@ -200,6 +201,9 @@ impl TurnRunner {
         // cannot resurrect a live process).
         if self.user_bash.is_running() {
             return None;
+        }
+        if unload {
+            return Some(std::time::Duration::ZERO);
         }
         let settings =
             pa_core::settings::SettingsManager::create(&cwd, &self.passivation.agent_dir);
@@ -218,7 +222,7 @@ impl TurnRunner {
     /// Re-check the gates on a fresh snapshot, then ask the supervisor
     /// for the graceful stop. A failed request leaves the worker resident.
     pub(super) async fn maybe_request_idle_passivation(&self) {
-        let (attached, compacting, shutdown, queued, last_activity, cwd) = {
+        let (attached, compacting, shutdown, queued, last_activity, cwd, unload) = {
             let core = self.core.lock().unwrap();
             (
                 core.attached_client_ids.is_empty(),
@@ -231,6 +235,7 @@ impl TurnRunner {
                     || self.input_pauses.paused(),
                 core.last_activity_ms,
                 core.cwd.clone(),
+                core.unload_when_detached,
             )
         };
         // Any state change since the window armed cancels the
@@ -241,16 +246,22 @@ impl TurnRunner {
         if self.user_bash.is_running() {
             return;
         }
-        let settings =
-            pa_core::settings::SettingsManager::create(&cwd, &self.passivation.agent_dir);
-        let minutes = match settings.get_idle_eviction() {
-            pa_core::settings::IdleEviction::Off => return,
-            pa_core::settings::IdleEviction::Minutes(minutes) => minutes,
+        let minutes = if unload {
+            None
+        } else {
+            let settings =
+                pa_core::settings::SettingsManager::create(&cwd, &self.passivation.agent_dir);
+            let minutes = match settings.get_idle_eviction() {
+                pa_core::settings::IdleEviction::Off => return,
+                pa_core::settings::IdleEviction::Minutes(minutes) => minutes,
+            };
+            // The idle threshold still holds on the fresh clock.
+            if crate::util::now_ms().saturating_sub(last_activity) < minutes.saturating_mul(60_000)
+            {
+                return;
+            }
+            Some(minutes)
         };
-        // The idle threshold still holds on the fresh clock.
-        if crate::util::now_ms().saturating_sub(last_activity) < minutes.saturating_mul(60_000) {
-            return;
-        }
         // The engine gate's one definition lives with the engine
         // (`SessionEngine::can_passivate_worker`); a failing worker stays resident.
         if !self.engine.can_passivate_worker().await {
@@ -287,10 +298,12 @@ impl TurnRunner {
         if self.user_bash.is_running() {
             return;
         }
+        self.core.lock().unwrap().unload_when_detached = false;
         let command = serde_json::json!({
             "type": "worker_idle_passivation",
             "workerToken": self.passivation.worker_token,
             "idleMinutes": minutes,
+            "unloadWhenDetached": unload,
         });
         // The timeout only bounds the ask, not the stop: the supervisor's
         // stop path runs the routed shutdown back into this worker.

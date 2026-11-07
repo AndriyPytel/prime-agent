@@ -688,6 +688,7 @@ impl Supervisor {
             DaemonCommand::WorkerIdlePassivation {
                 worker_token,
                 idle_minutes,
+                rest,
                 ..
             } => {
                 let response = self
@@ -696,6 +697,7 @@ impl Supervisor {
                         &type_name,
                         worker_token,
                         *idle_minutes,
+                        rest.get("unloadWhenDetached").and_then(Value::as_bool) == Some(true),
                     )
                     .await;
                 (vec![response_line(&response)], false)

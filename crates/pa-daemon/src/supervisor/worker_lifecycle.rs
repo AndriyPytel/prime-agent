@@ -665,6 +665,7 @@ impl Supervisor {
         type_name: &str,
         worker_token: &str,
         idle_minutes: Option<u64>,
+        unload_when_detached: bool,
     ) -> DaemonResponse {
         let Some(resident) = self.registry.find_by_token(worker_token).await else {
             return response_failure(
@@ -685,41 +686,61 @@ impl Supervisor {
             );
         }
         // The supervisor-side settings re-read (the fence): the same
-        // `idleEvictionMinutes` surface the worker read.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-        let settings =
-            pa_core::settings::SettingsManager::create(cwd.as_path(), &self.options.agent_dir);
-        let threshold = match settings.get_idle_eviction() {
-            pa_core::settings::IdleEviction::Off => {
-                return response_success(Some(command_id), type_name, None);
+        // `idleEvictionMinutes` surface the worker read. An unload after the last
+        // client detached (an ACP `session/close`) does not depend on the setting.
+        let threshold = if unload_when_detached {
+            None
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let settings =
+                pa_core::settings::SettingsManager::create(cwd.as_path(), &self.options.agent_dir);
+            let threshold = match settings.get_idle_eviction() {
+                pa_core::settings::IdleEviction::Off => {
+                    return response_success(Some(command_id), type_name, None);
+                }
+                pa_core::settings::IdleEviction::Minutes(minutes) => minutes,
+            };
+            // The idle claim the worker reported must match the live setting (a stale ask
+            // against a raised threshold is refused).
+            if let Some(reported) = idle_minutes {
+                if reported != threshold {
+                    return response_success(Some(command_id), type_name, None);
+                }
             }
-            pa_core::settings::IdleEviction::Minutes(minutes) => minutes,
+            Some(threshold)
         };
-        // The idle claim the worker reported must match the live setting (a stale ask
-        // against a raised threshold is refused).
-        if let Some(reported) = idle_minutes {
-            if reported != threshold {
-                return response_success(Some(command_id), type_name, None);
-            }
-        }
         // TS `withEvictionFence`: holding every in-flight route permit
         // proves no routed request is still running on this worker (a
         // drained `cron_add` or prompt would fail TS's fresh
         // `canEvictWorker`), and refuses new client routes until the
         // stop has retired the worker. A request in flight defers the
         // passivation; the worker's next park re-asks.
-        let Ok(fence) = Arc::clone(&resident.inflight).try_acquire_many_owned(
-            u32::try_from(crate::backpressure::WORKER_INFLIGHT_CAPACITY)
-                .expect("in-flight capacity fits u32"),
-        ) else {
+        let permits = u32::try_from(crate::backpressure::WORKER_INFLIGHT_CAPACITY)
+            .expect("in-flight capacity fits u32");
+        let inflight = Arc::clone(&resident.inflight);
+        // The detach that asked for the unload still holds its own permit while the
+        // worker asks, so the unload waits it out; an idle-eviction ask just defers.
+        let fence = if unload_when_detached {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                inflight.acquire_many_owned(permits),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        } else {
+            inflight.try_acquire_many_owned(permits).ok()
+        };
+        let Some(fence) = fence else {
             return response_success(Some(command_id), type_name, None);
         };
         match self.stop_worker_releasing(&resident, Some(fence)).await {
             Ok(()) => {
-                self.log_line(&format!(
-                    "session worker {} passivated idle (idleEvictionMinutes={threshold})",
-                    resident.worker_id
-                ));
+                let reason = threshold.map_or_else(
+                    || "unloaded after the last client detached".to_string(),
+                    |minutes| format!("passivated idle (idleEvictionMinutes={minutes})"),
+                );
+                self.log_line(&format!("session worker {} {reason}", resident.worker_id));
                 response_success(Some(command_id), type_name, None)
             }
             Err(error) => response_failure(

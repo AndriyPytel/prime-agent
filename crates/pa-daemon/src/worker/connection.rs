@@ -833,6 +833,7 @@ impl Worker {
         if retained && !core.attached_client_ids.iter().any(|id| id == &client_id) {
             core.attached_client_ids.push(client_id.clone());
         }
+        core.unload_when_detached = false;
         let summary = self.summary_locked(&core, summary_inputs);
         let client_capabilities = echoed_client_capabilities
             .clone()
@@ -1062,6 +1063,8 @@ impl Worker {
         if !held_elsewhere {
             core.attached_client_ids.retain(|id| id != &client_id);
         }
+        core.unload_when_detached = core.attached_client_ids.is_empty()
+            && payload.get("unloadWhenIdle").and_then(Value::as_bool) == Some(true);
         drop(core);
         // The notify re-arms the runner's idle-passivation window now
         // that the client detached.

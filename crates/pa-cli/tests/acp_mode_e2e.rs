@@ -3301,3 +3301,42 @@ fn acp_session_close_detaches_without_stopping_the_running_turn() {
         "the turn finished its whole answer after the viewer closed"
     );
 }
+
+#[test]
+fn acp_session_close_unloads_the_worker_a_load_started() {
+    let (first, session_id, _file) = saved_session_with_one_turn();
+    shutdown_sandboxed_daemon(&first.socket);
+    let deadline = Instant::now() + TIMEOUT;
+    while pa_types::platform::transport::connect_blocking(&first.socket).is_ok() {
+        assert!(Instant::now() < deadline, "the daemon never shut down");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let load = second.request(
+        "session/load",
+        &json!({ "sessionId": session_id, "cwd": session_cwd(&first), "mcpServers": [] }),
+    );
+    let (response, _) = second.wait_response(load, TIMEOUT);
+    assert!(response["result"]["configOptions"].is_array(), "{response}");
+    assert_eq!(live_sessions(&first.socket).len(), 1);
+    let close = second.request("session/close", &json!({ "sessionId": session_id }));
+    let (response, _) = second.wait_response(close, TIMEOUT);
+    assert_eq!(response["result"], json!({}));
+    let deadline = Instant::now() + TIMEOUT;
+    while !live_sessions(&first.socket).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the closed session's worker never unloaded: {:?}",
+            live_sessions(&first.socket)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let list = second.request("session/list", &json!({ "cwd": session_cwd(&first) }));
+    let (response, _) = second.wait_response(list, TIMEOUT);
+    assert_eq!(
+        response["result"]["sessions"][0]["sessionId"], session_id,
+        "an unloaded session stays listed: {response}"
+    );
+}

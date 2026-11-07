@@ -1682,7 +1682,13 @@ async fn idle_passivation_requires_the_worker_token() {
     );
     // An unknown token answers the authentication failure.
     let response = supervisor
-        .handle_worker_idle_passivation("c1", "worker_idle_passivation", "no-such-token", Some(1))
+        .handle_worker_idle_passivation(
+            "c1",
+            "worker_idle_passivation",
+            "no-such-token",
+            Some(1),
+            /*unload_when_detached*/ false,
+        )
         .await;
     assert!(!response.success);
     assert!(
@@ -1753,7 +1759,13 @@ async fn idle_passivation_refuses_a_client_owned_worker() {
     let resident = ResidentWorker::new("w-owned".to_string(), descriptor, dir.path().join("w.d"));
     supervisor.registry.insert(resident).await;
     let response = supervisor
-        .handle_worker_idle_passivation("c1", "worker_idle_passivation", "owned-token", Some(1))
+        .handle_worker_idle_passivation(
+            "c1",
+            "worker_idle_passivation",
+            "owned-token",
+            Some(1),
+            /*unload_when_detached*/ false,
+        )
         .await;
     assert!(!response.success);
     assert!(
@@ -1772,7 +1784,13 @@ async fn idle_passivation_refuses_a_client_owned_worker() {
     supervisor.registry.insert(resident.clone()).await;
     let in_flight = Arc::clone(&resident.inflight).try_acquire_owned().unwrap();
     supervisor
-        .handle_worker_idle_passivation("c3", "worker_idle_passivation", "idle-token", None)
+        .handle_worker_idle_passivation(
+            "c3",
+            "worker_idle_passivation",
+            "idle-token",
+            None,
+            /*unload_when_detached*/ false,
+        )
         .await;
     assert!(
         supervisor.registry.get("w-idle").await.is_some(),
@@ -1784,7 +1802,13 @@ async fn idle_passivation_refuses_a_client_owned_worker() {
     );
     drop(in_flight);
     supervisor
-        .handle_worker_idle_passivation("c4", "worker_idle_passivation", "idle-token", None)
+        .handle_worker_idle_passivation(
+            "c4",
+            "worker_idle_passivation",
+            "idle-token",
+            None,
+            /*unload_when_detached*/ false,
+        )
         .await;
     assert!(
         supervisor.registry.get("w-idle").await.is_none(),

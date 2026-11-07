@@ -2693,13 +2693,14 @@ async fn handle_session_close(
         let _ = close_done.send(true);
         return;
     };
-    // Closing only releases this connection's hold: the session and any
-    // running turn belong to the daemon (`session/cancel` stops a turn).
+    // Closing only releases this connection's hold: a running turn belongs to
+    // the daemon (`session/cancel` stops it). The worker unloads only when the
+    // detach leaves it idle and unattached.
     let close_result = link
         .request_ok(DaemonCommand::Detach {
             id: None,
             active_session_id: Some(daemon_session_id.clone()),
-            rest: Map::default(),
+            rest: Map::from_iter([("unloadWhenIdle".to_string(), json!(true))]),
         })
         .await;
     if close_result.is_ok() {

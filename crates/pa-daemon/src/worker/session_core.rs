@@ -21,6 +21,9 @@ pub(crate) struct SessionCore {
     pub(crate) busy: bool,
     pub(crate) created: bool,
     pub(crate) attached_client_ids: Vec<String>,
+    /// Set by a detach that left no client attached and asked for the worker to
+    /// unload once idle; an attach clears it.
+    pub(crate) unload_when_detached: bool,
     pub(crate) abort_requested: bool,
     /// A flow that detaches from the interrupted turn's events (a manual
     /// `compact`, a branch navigation) swallowed the aborted row in TS, so the
@@ -122,6 +125,7 @@ impl SessionCore {
             busy: false,
             created: true,
             attached_client_ids: Vec::new(),
+            unload_when_detached: false,
             abort_requested: false,
             suppress_aborted_row: false,
             shutdown_requested: false,

@@ -295,6 +295,7 @@ impl Worker {
             busy: false,
             created: false,
             attached_client_ids: Vec::new(),
+            unload_when_detached: false,
             abort_requested: false,
             suppress_aborted_row: false,
             shutdown_requested: false,
