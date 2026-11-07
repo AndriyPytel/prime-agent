@@ -196,7 +196,43 @@ pub fn resolve_session_path(
         return Ok(ResolvedSession::Path(PathBuf::from(selector)));
     }
 
-    let headers = scan_session_headers(session_dir);
+    match resolve_among(selector, cwd, &scan_session_headers(session_dir)) {
+        Err(not_found @ SessionSelectorError::NotFound { .. }) => {
+            match resolve_among(selector, cwd, &scan_subagent_headers(session_dir)) {
+                Err(SessionSelectorError::NotFound { .. }) => Err(not_found),
+                resolved => resolved,
+            }
+        }
+        resolved => resolved,
+    }
+}
+
+/// Subagent transcripts live at `<agent>/session-artifacts/<parent>/sub-*/<id>.jsonl`,
+/// beside the `sessions` directory.
+fn scan_subagent_headers(session_dir: &Path) -> Vec<SessionHeaderInfo> {
+    let Some(artifacts) = session_dir
+        .parent()
+        .map(|dir| dir.join("session-artifacts"))
+    else {
+        return Vec::new();
+    };
+    let Ok(parents) = std::fs::read_dir(artifacts) else {
+        return Vec::new();
+    };
+    parents
+        .flatten()
+        .filter_map(|parent| std::fs::read_dir(parent.path()).ok())
+        .flat_map(Iterator::flatten)
+        .filter(|child| child.file_name().to_string_lossy().starts_with("sub-"))
+        .flat_map(|child| scan_session_headers(&child.path()))
+        .collect()
+}
+
+fn resolve_among(
+    selector: &str,
+    cwd: &Path,
+    headers: &[SessionHeaderInfo],
+) -> Result<ResolvedSession, SessionSelectorError> {
     let local: Vec<SessionHeaderInfo> = headers
         .iter()
         .filter(|header| header_matches_cwd(header, cwd))
@@ -248,7 +284,7 @@ pub fn resolve_session_path(
 
     Err(SessionSelectorError::NotFound {
         selector: selector.to_string(),
-        suggestion: find_closest_session_id(selector, &local, &headers),
+        suggestion: find_closest_session_id(selector, &local, headers),
     })
 }
 
@@ -348,6 +384,27 @@ mod tests {
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn subagent_session_ids_resolve_under_session_artifacts() {
+        let root = temp_dir();
+        let sessions = root.path().join("sessions");
+        let child_dir = root
+            .path()
+            .join("session-artifacts")
+            .join("01a0parent")
+            .join("sub-ab12cd34");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let path = write_session(&child_dir, "01a1a280-cf71-74ba-8c03-c9b6c5a541bd", "/work");
+        let resolved = resolve_session_path(
+            "01a1a280-cf71-74ba-8c03-c9b6c5a541bd",
+            Path::new("/work"),
+            &sessions,
+        )
+        .unwrap();
+        assert_eq!(resolved, ResolvedSession::Local(path));
     }
 
     #[test]
