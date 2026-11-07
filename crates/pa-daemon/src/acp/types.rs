@@ -42,6 +42,7 @@ pub struct McpCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCapabilities {
+    pub list: CloseCapability,
     pub close: CloseCapability,
     pub resume: CloseCapability,
     pub fork: CloseCapability,
@@ -453,6 +454,7 @@ pub fn initialize_result(product_version: &str, air: bool) -> InitializeResult {
             },
             mcp_capabilities: Some(McpCapabilities { http: true }),
             session_capabilities: SessionCapabilities {
+                list: CloseCapability::default(),
                 close: CloseCapability::default(),
                 resume: CloseCapability::default(),
                 fork: CloseCapability::default(),
@@ -491,7 +493,7 @@ mod tests {
                     "loadSession": true,
                     "promptCapabilities": { "image": true, "embeddedContext": true },
                     "mcpCapabilities": { "http": true },
-                    "sessionCapabilities": { "close": {}, "resume": {}, "fork": {} },
+                    "sessionCapabilities": { "list": {}, "close": {}, "resume": {}, "fork": {} },
                 },
                 "agentInfo": { "name": "prime-agent", "title": "Prime Agent", "version": "9.9.9" },
                 "_meta": { "ai.primeintellect.prime-agent": {} },

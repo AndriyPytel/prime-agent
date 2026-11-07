@@ -310,7 +310,7 @@ fn acp_initialize_matches_the_ts_golden() {
     );
     assert_eq!(
         capabilities["sessionCapabilities"],
-        json!({ "close": {}, "resume": {}, "fork": {} })
+        json!({ "list": {}, "close": {}, "resume": {}, "fork": {} })
     );
     // ACP MCP server admission is served, so the http capability is advertised.
     assert_eq!(capabilities["mcpCapabilities"], json!({ "http": true }));
@@ -3239,4 +3239,28 @@ fn acp_first_session_new_honors_params_cwd_when_the_flags_select_no_session() {
     let header = pa_core::session::manager::read_session_header(std::path::Path::new(file))
         .expect("a session header");
     assert_eq!(header.cwd, work_path);
+}
+
+#[test]
+fn acp_session_list_serves_saved_sessions_without_drafts() {
+    let (first, session_id, _file) = saved_session_with_one_turn();
+    let mut second = next_process(&first);
+    let init = second.request("initialize", &initialize_params());
+    let _ = second.wait_response(init, TIMEOUT);
+    let _draft = new_session(&mut second);
+    let cwd = session_cwd(&first);
+    let list = second.request("session/list", &json!({ "cwd": cwd }));
+    let (response, _) = second.wait_response(list, TIMEOUT);
+    let mut result = response["result"].clone();
+    assert!(result["sessions"][0]["updatedAt"].is_string(), "{response}");
+    result["sessions"][0]["updatedAt"] = json!(null);
+    assert_eq!(
+        result,
+        json!({ "sessions": [
+            { "sessionId": session_id, "cwd": cwd, "title": "Name a river.", "updatedAt": null },
+        ] })
+    );
+    let other = second.request("session/list", &json!({ "cwd": "/nowhere" }));
+    let (response, _) = second.wait_response(other, TIMEOUT);
+    assert_eq!(response["result"], json!({ "sessions": [] }));
 }

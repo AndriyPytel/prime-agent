@@ -71,7 +71,7 @@ pub(crate) struct DaemonLink {
 }
 
 impl DaemonLink {
-    async fn connect(socket_path: &Path) -> anyhow::Result<Self> {
+    pub(super) async fn connect(socket_path: &Path) -> anyhow::Result<Self> {
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             pa_types::platform::transport::connect_transport(socket_path),
@@ -596,7 +596,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
 }
 
 /// The event-consumer task of one host's link.
-fn spawn_event_consumer(
+pub(super) fn spawn_event_consumer(
     link: Arc<DaemonLink>,
     state: Arc<Mutex<DaemonAcpState>>,
 ) -> tokio::task::AbortHandle {
@@ -1261,6 +1261,9 @@ async fn handle_incoming(
     match (method.as_str(), host) {
         ("initialize", _) => {
             handle_initialize(&id, &params, &options.product_version, &tx, air);
+        }
+        ("session/list", _) => {
+            super::list::handle_session_list(&id, &params, &options.socket_path, &tx).await;
         }
         ("session/set_config_option", Some(host)) => {
             handle_set_config_option(id, params, &host.link, &host.state, tx).await;

@@ -3,6 +3,7 @@
 mod config_options;
 pub mod daemon;
 mod jsonrpc;
+mod list;
 mod mcp;
 mod meta;
 mod producer;
