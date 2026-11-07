@@ -2673,77 +2673,59 @@ async fn handle_session_close(
     if let Some(mut cancel_task) = cancel_task {
         let _ = cancel_task.changed().await;
     }
-    let (acp_session_id, daemon_session_id, config, producer, admission_id) = {
-        let mut guard = state.lock().await;
-        let Some(hosted) = guard
+    let hosted = {
+        let guard = state.lock().await;
+        guard
             .session
-            .as_mut()
+            .as_ref()
             .filter(|hosted| hosted.acp_session_id == session_id)
-        else {
-            drop(guard);
-            state.lock().await.session_close_done = None;
-            let _ = close_done.send(true);
-            return;
-        };
-        hosted.cancelling = true;
-        if let Some(turn) = hosted.turn.as_mut() {
-            turn.cancelled = true;
-        }
-        let admission_id = hosted.turn.as_ref().map(|turn| turn.admission_id.clone());
-        (
-            hosted.acp_session_id.clone(),
-            hosted.daemon_active_session_id.clone(),
-            Arc::clone(&hosted.config),
-            Arc::clone(&hosted.producer),
-            admission_id,
-        )
+            .map(|hosted| {
+                (
+                    hosted.daemon_active_session_id.clone(),
+                    hosted.input_pause_id.clone(),
+                    Arc::clone(&hosted.config),
+                    Arc::clone(&hosted.producer),
+                )
+            })
     };
-    let close_result = match acquire_stop_input_pause(link, state, &acp_session_id).await {
-        Ok(lease) => {
-            match stop_session_work(link, &daemon_session_id, admission_id.as_deref()).await {
-                Ok(()) => {
-                    // The serialized config work settles before the
-                    // producer fences (TS `await configTask`).
-                    let _ = config.queue.lock().await;
-                    producer.close().await;
-                    let _ =
-                        clear_connection_servers(link, &daemon_session_id, &owner_id, state).await;
-                    let mut guard = state.lock().await;
-                    guard.closed_input_pause_id = Some(lease.pause_id.clone());
-                    guard.closed_input_pause_key = Some(lease.lease_key.clone());
-                    if let Some(hosted) = guard
-                        .session
-                        .as_mut()
-                        .filter(|hosted| hosted.acp_session_id == session_id)
-                    {
-                        if hosted.input_pause_id.as_deref() == Some(&lease.pause_id) {
-                            hosted.input_pause_id = None;
-                        }
-                        if hosted.input_pause_key.as_deref() == Some(&lease.lease_key) {
-                            hosted.input_pause_key = None;
-                        }
-                        hosted.stop_failure = None;
-                    }
-                    guard
-                        .session
-                        .take_if(|hosted| hosted.acp_session_id == session_id);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
+    let Some((daemon_session_id, input_pause_id, config, producer)) = hosted else {
+        state.lock().await.session_close_done = None;
+        let _ = close_done.send(true);
+        return;
     };
+    // Closing only releases this connection's hold: the session and any
+    // running turn belong to the daemon (`session/cancel` stops a turn).
+    let close_result = link
+        .request_ok(DaemonCommand::Detach {
+            id: None,
+            active_session_id: Some(daemon_session_id.clone()),
+            rest: Map::default(),
+        })
+        .await;
+    if close_result.is_ok() {
+        if let Some(pause_id) = input_pause_id.as_ref() {
+            let _ = release_session_input_pause(link, &daemon_session_id, pause_id).await;
+        }
+        let _ = config.queue.lock().await;
+        producer.close().await;
+        let _ = clear_connection_servers(link, &daemon_session_id, &owner_id, state).await;
+    }
     {
         let mut guard = state.lock().await;
-        if let Some(hosted) = guard
-            .session
-            .as_mut()
-            .filter(|hosted| hosted.acp_session_id == acp_session_id)
-        {
-            hosted.cancelling = false;
-            if let Err(error) = &close_result {
-                hosted.stop_failure = Some(error.to_string());
+        match &close_result {
+            Ok(()) => {
+                guard
+                    .session
+                    .take_if(|hosted| hosted.acp_session_id == session_id);
+            }
+            Err(error) => {
+                if let Some(hosted) = guard
+                    .session
+                    .as_mut()
+                    .filter(|hosted| hosted.acp_session_id == session_id)
+                {
+                    hosted.stop_failure = Some(error.to_string());
+                }
             }
         }
         guard.session_close_done = None;

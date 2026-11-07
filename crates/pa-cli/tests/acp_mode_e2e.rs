@@ -3264,3 +3264,40 @@ fn acp_session_list_serves_saved_sessions_without_drafts() {
     let (response, _) = second.wait_response(other, TIMEOUT);
     assert_eq!(response["result"], json!({ "sessions": [] }));
 }
+
+#[test]
+fn acp_session_close_detaches_without_stopping_the_running_turn() {
+    let answer = "a paced answer that streams slowly enough to close mid-turn";
+    let mut owner = AcpChild::spawn(
+        &["--mode", "acp"],
+        &json!({ "engine": "faux", "tokensPerSecond": 2, "responses": [{ "text": answer }] }),
+    );
+    let session_id = initialize_and_new_session(&mut owner);
+    let prompt = owner.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "a slow question" }] }),
+    );
+    owner.wait_update("agent_message_chunk", TIMEOUT);
+    let mut viewer = next_process(&owner);
+    let init = viewer.request("initialize", &initialize_params());
+    let _ = viewer.wait_response(init, TIMEOUT);
+    let load = viewer.request(
+        "session/load",
+        &json!({ "sessionId": session_id, "cwd": session_cwd(&owner), "mcpServers": [] }),
+    );
+    let (response, _) = viewer.wait_response(load, TIMEOUT);
+    assert!(response["result"]["configOptions"].is_array(), "{response}");
+    let close = viewer.request("session/close", &json!({ "sessionId": session_id }));
+    let (response, _) = viewer.wait_response(close, TIMEOUT);
+    assert_eq!(response["result"], json!({}));
+    let (prompt_response, _) = owner.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&prompt_response);
+    let file = live_sessions(&owner.socket)[0]["sessionFile"]
+        .as_str()
+        .expect("a saved session")
+        .to_string();
+    assert!(
+        std::fs::read_to_string(file).unwrap().contains(answer),
+        "the turn finished its whole answer after the viewer closed"
+    );
+}
