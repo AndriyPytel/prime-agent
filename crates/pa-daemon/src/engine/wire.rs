@@ -110,6 +110,8 @@ pub enum EngineEvent {
     /// their own events; this frame carries only the accumulated payload.
     AgentEnd {
         messages: Vec<Value>,
+        /// Immutable cancellation outcome from the loop producer.
+        aborted: bool,
     },
     /// A durable custom message (wire `role: "custom"`): recorded into the
     /// session store, framed to clients as a `message_start` + `message_end` pair.
@@ -154,6 +156,7 @@ pub enum EngineEvent {
     /// `auto_retry_end`: the retry loop settled. `restored_model` is the
     /// `"provider/model-id"` primary restored after a failover switch.
     AutoRetryEnd {
+        aborted: bool,
         success: bool,
         attempt: u32,
         final_error: Option<String>,
@@ -272,6 +275,9 @@ pub struct RlmSessionIdentity {
     /// file is a top-level runtime and spawns no edge, and a replacement
     /// runtime has none.
     pub semantic_spawn: Option<SemanticSpawnOrigin>,
+    /// The create's runtime metadata carries a factory run tag: the
+    /// session runs one factory state.
+    pub factory_child: bool,
 }
 
 /// A created session's semantic-edge provenance (TS

@@ -62,10 +62,6 @@ pub struct SessionManager {
     session_dir: PathBuf,
     cwd: PathBuf,
     persist: bool,
-    /// Whether the manager carries a session directory of its own (any
-    /// persisted manager, and the daemon's mirrored engine session): the
-    /// session-owned artifacts (local harness state) resolve under it.
-    session_dir_backed: bool,
     flushed: bool,
     has_assistant_entry: bool,
     append_ownership: super::window::AppendOwnership,
@@ -78,6 +74,8 @@ pub struct SessionManager {
     /// Exact worker-owned rows replayed by the current prompt admission.
     admitted_user_rows: std::collections::VecDeque<String>,
     persist_listeners: Vec<SessionPersistListener>,
+    /// Told about each appended row that bills a model call.
+    billed_row_sink: Option<super::billed_row::BilledRowSink>,
 }
 
 /// The refine transcript's consumed artifacts: the conversation message

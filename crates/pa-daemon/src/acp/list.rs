@@ -79,7 +79,11 @@ fn session_list_result(summaries: &[Value], params: &Value) -> Result<Value, Str
             summary["lifecycle"] != "archived"
                 && summary["messageCount"].as_u64() != Some(0)
                 && summary["sessionId"].is_string()
-                && cwd.is_none_or(|cwd| summary["cwd"] == cwd)
+                && cwd.is_none_or(|cwd| {
+                    summary["cwd"]
+                        .as_str()
+                        .is_some_and(|row| super::same_cwd(Path::new(cwd), Path::new(row)))
+                })
         })
         .collect();
     rows.sort_by(|a, b| b["modified"].as_str().cmp(&a["modified"].as_str()));

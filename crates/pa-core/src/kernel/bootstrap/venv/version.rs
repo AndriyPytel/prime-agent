@@ -3,6 +3,8 @@
 use super::{default_rlm_extra_uv_args, BootstrapPythonSkill, BootstrapVersion, Path};
 
 /// Schema of `.bootstrap-version`; a mismatch rebuilds the venv.
+// Rebuild existing shared venvs so project Python skills previously installed
+// as editable packages cannot keep executing through site-packages startup.
 pub(super) const BOOTSTRAP_SCHEMA: u64 = 10;
 pub(super) const STATE_SNAPSHOT_REQUIREMENT: &str = "dill";
 const BOOTSTRAP_VERSION_FILE: &str = ".bootstrap-version";

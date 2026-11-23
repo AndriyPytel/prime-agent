@@ -25,6 +25,10 @@ pub(crate) struct SessionCore {
     /// unload once idle; an attach clears it.
     pub(crate) unload_when_detached: bool,
     pub(crate) abort_requested: bool,
+    /// Explicit cancellation of this picked delivery; graceful shutdown is excluded.
+    pub(crate) turn_cancelled: bool,
+    /// A successful terminal Done was observed for this picked delivery.
+    pub(crate) turn_completed: bool,
     /// A flow that detaches from the interrupted turn's events (a manual
     /// `compact`, a branch navigation) swallowed the aborted row in TS, so the
     /// gate's aborted-row exception stays closed while it settles its turn.
@@ -127,6 +131,8 @@ impl SessionCore {
             attached_client_ids: Vec::new(),
             unload_when_detached: false,
             abort_requested: false,
+            turn_cancelled: false,
+            turn_completed: false,
             suppress_aborted_row: false,
             shutdown_requested: false,
             last_activity_ms: 0,

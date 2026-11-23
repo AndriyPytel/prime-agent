@@ -1,7 +1,8 @@
 //! ACP wire types: the method surface, `session/update` payload shapes,
-//! and prompt-block parsing. The served surface is exactly what the TS
-//! product serves; ACP-spec methods it does not serve (`session/load`,
-//! `session/read`, `session/clone`, cwd adoption) are not invented here.
+//! and prompt-block parsing. The served surface is the TS product's plus
+//! the stable `session/list` and `session/load`; other ACP-spec methods
+//! (`session/resume`, `session/read`, `session/clone`, cwd adoption) are
+//! not served.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
